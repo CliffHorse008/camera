@@ -1,0 +1,386 @@
+#include "rtsp_client.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "rtsp_common.h"
+
+struct client_track {
+    enum rtsp_client_media_type media_type;
+    char control_url[512];
+    uint8_t payload_type;
+    uint8_t rtp_channel;
+    uint8_t rtcp_channel;
+    uint8_t *fu_buf;
+    size_t fu_size;
+    size_t fu_cap;
+    int configured;
+};
+
+struct rtsp_client_ctx {
+    int fd;
+    int cseq;
+    char session_id[128];
+    struct rtsp_url parsed_url;
+    struct client_track tracks[2];
+    rtsp_client_frame_callback on_frame;
+    void *user_data;
+};
+
+static int client_send_request(struct rtsp_client_ctx *ctx, const char *request) {
+    return rtsp_send_all(ctx->fd, request, strlen(request));
+}
+
+static int client_read_response(struct rtsp_client_ctx *ctx, char *buf, size_t cap) {
+    size_t len = 0;
+    (void)ctx;
+    return rtsp_read_message(ctx->fd, buf, cap, &len);
+}
+
+static int client_send_simple(struct rtsp_client_ctx *ctx, const char *method, const char *url,
+                              const char *extra_headers, char *response, size_t response_size) {
+    char req[RTSP_MAX_MESSAGE];
+    int cseq = ++ctx->cseq;
+    snprintf(req, sizeof(req),
+             "%s %s RTSP/1.0\r\n"
+             "CSeq: %d\r\n"
+             "%s"
+             "\r\n",
+             method, url, cseq, extra_headers != NULL ? extra_headers : "");
+    if (client_send_request(ctx, req) < 0) {
+        return -1;
+    }
+    return client_read_response(ctx, response, response_size);
+}
+
+static int parse_session_id(const char *response, char *out, size_t out_size) {
+    char value[128];
+    char *semi = NULL;
+    if (rtsp_find_header(response, "Session", value, sizeof(value)) < 0) {
+        return -1;
+    }
+    semi = strchr(value, ';');
+    if (semi != NULL) {
+        *semi = '\0';
+    }
+    snprintf(out, out_size, "%s", value);
+    return 0;
+}
+
+static int ensure_fu_capacity(struct client_track *track, size_t needed) {
+    if (needed <= track->fu_cap) {
+        return 0;
+    }
+    size_t new_cap = track->fu_cap == 0 ? 4096 : track->fu_cap;
+    while (new_cap < needed) {
+        new_cap *= 2;
+    }
+    uint8_t *p = (uint8_t *)realloc(track->fu_buf, new_cap);
+    if (p == NULL) {
+        return -1;
+    }
+    track->fu_buf = p;
+    track->fu_cap = new_cap;
+    return 0;
+}
+
+static int parse_tracks_from_sdp(struct rtsp_client_ctx *ctx, const char *describe_response) {
+    char content_base[512];
+    const char *body = strstr(describe_response, "\r\n\r\n");
+    const char *line = NULL;
+    struct client_track *current = NULL;
+    int track_count = 0;
+
+    if (body == NULL) {
+        return -1;
+    }
+    body += 4;
+
+    if (rtsp_find_header(describe_response, "Content-Base", content_base, sizeof(content_base)) < 0) {
+        snprintf(content_base, sizeof(content_base), "%s", ctx->parsed_url.url);
+    }
+
+    /* 这里保持解析逻辑尽量简单，只提取每条 track 的 control URL 和 payload type。 */
+    memset(ctx->tracks, 0, sizeof(ctx->tracks));
+    line = body;
+    while (*line != '\0') {
+        const char *line_end = strstr(line, "\r\n");
+        size_t len = line_end != NULL ? (size_t)(line_end - line) : strlen(line);
+
+        if (len > 2 && strncmp(line, "m=", 2) == 0) {
+            char media[32];
+            int payload_type = 0;
+            if (sscanf(line, "m=%31s 0 RTP/AVP %d", media, &payload_type) == 2) {
+                if (strcmp(media, "video") == 0 && track_count < 2) {
+                    current = &ctx->tracks[track_count++];
+                    current->media_type = RTSP_CLIENT_MEDIA_VIDEO;
+                    current->payload_type = (uint8_t)payload_type;
+                } else if (strcmp(media, "audio") == 0 && track_count < 2) {
+                    current = &ctx->tracks[track_count++];
+                    current->media_type = RTSP_CLIENT_MEDIA_AUDIO;
+                    current->payload_type = (uint8_t)payload_type;
+                } else {
+                    current = NULL;
+                }
+            }
+        } else if (current != NULL && len > 10 && strncmp(line, "a=control:", 10) == 0) {
+            char value[256];
+            if (len - 10 >= sizeof(value)) {
+                return -1;
+            }
+            memcpy(value, line + 10, len - 10);
+            value[len - 10] = '\0';
+            if (rtsp_build_control_url(content_base, value, current->control_url,
+                                       sizeof(current->control_url)) < 0) {
+                return -1;
+            }
+            current->configured = 1;
+        }
+
+        if (line_end == NULL) {
+            break;
+        }
+        line = line_end + 2;
+    }
+
+    return track_count > 0 ? track_count : -1;
+}
+
+static int handle_rtp_payload(struct rtsp_client_ctx *ctx, struct client_track *track,
+                              const uint8_t *payload, size_t payload_size) {
+    uint8_t nal_type = 0;
+    if (payload_size == 0) {
+        return 0;
+    }
+
+    if (track->media_type == RTSP_CLIENT_MEDIA_AUDIO) {
+        /* PCM 数据一包 RTP 就是完整负载，直接上抛。 */
+        ctx->on_frame(RTSP_CLIENT_MEDIA_AUDIO, payload, payload_size, ctx->user_data);
+        return 0;
+    }
+
+    /* 单 NAL RTP 包可直接回调给上层。 */
+    nal_type = (uint8_t)(payload[0] & 0x1f);
+    if (nal_type >= 1 && nal_type <= 23) {
+        ctx->on_frame(RTSP_CLIENT_MEDIA_VIDEO, payload, payload_size, ctx->user_data);
+        return 0;
+    }
+
+    if (nal_type == 28 && payload_size >= 2) {
+        /* FU-A 分片需要先重组为完整 H264 NAL，再回调给上层。 */
+        uint8_t fu_header = payload[1];
+        int start = (fu_header & 0x80) != 0;
+        int end = (fu_header & 0x40) != 0;
+        uint8_t reconstructed_header = (uint8_t)((payload[0] & 0xe0) | (fu_header & 0x1f));
+        const uint8_t *chunk = payload + 2;
+        size_t chunk_size = payload_size - 2;
+
+        if (start) {
+            track->fu_size = 0;
+            if (ensure_fu_capacity(track, chunk_size + 1) < 0) {
+                return -1;
+            }
+            track->fu_buf[track->fu_size++] = reconstructed_header;
+        } else if (track->fu_size == 0) {
+            return -1;
+        } else if (ensure_fu_capacity(track, track->fu_size + chunk_size) < 0) {
+            return -1;
+        }
+
+        memcpy(track->fu_buf + track->fu_size, chunk, chunk_size);
+        track->fu_size += chunk_size;
+
+        if (end) {
+            ctx->on_frame(RTSP_CLIENT_MEDIA_VIDEO, track->fu_buf, track->fu_size, ctx->user_data);
+            track->fu_size = 0;
+        }
+    }
+
+    return 0;
+}
+
+static int handle_interleaved_frame(struct rtsp_client_ctx *ctx) {
+    uint8_t prefix[4];
+    uint8_t *packet = NULL;
+    struct client_track *track = NULL;
+    size_t payload_offset = 12;
+    uint16_t size = 0;
+    uint8_t cc = 0;
+    int extension = 0;
+
+    /* RTSP over TCP 的复用帧以 '$' + 通道号 + 16 位长度开头。 */
+    if (rtsp_recv_exact(ctx->fd, prefix, sizeof(prefix)) < 0) {
+        return -1;
+    }
+    size = (uint16_t)((prefix[2] << 8) | prefix[3]);
+    packet = (uint8_t *)malloc(size);
+    if (packet == NULL) {
+        return -1;
+    }
+    if (rtsp_recv_exact(ctx->fd, packet, size) < 0) {
+        free(packet);
+        return -1;
+    }
+
+    if (size < 12) {
+        free(packet);
+        return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(ctx->tracks) / sizeof(ctx->tracks[0]); ++i) {
+        if (ctx->tracks[i].configured && prefix[1] == ctx->tracks[i].rtp_channel) {
+            track = &ctx->tracks[i];
+            break;
+        }
+        if (ctx->tracks[i].configured && prefix[1] == ctx->tracks[i].rtcp_channel) {
+            /* 这里暂时忽略 RTCP，只处理 RTP 负载分发。 */
+            free(packet);
+            return 0;
+        }
+    }
+    if (track == NULL) {
+        free(packet);
+        return 0;
+    }
+
+    /* 跳过 RTP 的 CSRC 和扩展头，定位真正的媒体负载。 */
+    cc = (uint8_t)(packet[0] & 0x0f);
+    extension = (packet[0] & 0x10) != 0;
+    payload_offset += (size_t)cc * 4;
+    if (extension) {
+        if (payload_offset + 4 > size) {
+            free(packet);
+            return -1;
+        }
+        uint16_t ext_len = (uint16_t)((packet[payload_offset + 2] << 8) | packet[payload_offset + 3]);
+        payload_offset += 4 + (size_t)ext_len * 4;
+    }
+    if (payload_offset > size) {
+        free(packet);
+        return -1;
+    }
+
+    if (handle_rtp_payload(ctx, track, packet + payload_offset, size - payload_offset) < 0) {
+        free(packet);
+        return -1;
+    }
+
+    free(packet);
+    return 0;
+}
+
+static int receive_stream_loop(struct rtsp_client_ctx *ctx, const volatile sig_atomic_t *running) {
+    while (running == NULL || *running) {
+        uint8_t ch = 0;
+        ssize_t n = recv(ctx->fd, &ch, 1, MSG_PEEK);
+        if (n <= 0) {
+            return -1;
+        }
+        if (ch == '$') {
+            if (handle_interleaved_frame(ctx) < 0) {
+                return -1;
+            }
+        } else {
+            /* 如果服务端发来异步 RTSP 响应，这里把它消费掉。 */
+            char response[RTSP_MAX_MESSAGE];
+            if (client_read_response(ctx, response, sizeof(response)) < 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+int rtsp_client_run(const struct rtsp_client_config *config) {
+    struct rtsp_client_ctx ctx;
+    char response[RTSP_MAX_MESSAGE];
+    char headers[512];
+    int track_count = 0;
+    int rc = -1;
+
+    if (config == NULL || config->url == NULL || config->on_frame == NULL) {
+        return -1;
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fd = -1;
+    ctx.on_frame = config->on_frame;
+    ctx.user_data = config->user_data;
+
+    if (rtsp_parse_url(config->url, &ctx.parsed_url) < 0) {
+        goto done;
+    }
+
+    ctx.fd = rtsp_tcp_connect(ctx.parsed_url.host, ctx.parsed_url.port);
+    if (ctx.fd < 0) {
+        goto done;
+    }
+
+    if (client_send_simple(&ctx, "OPTIONS", ctx.parsed_url.url, NULL, response, sizeof(response)) < 0) {
+        goto done;
+    }
+    if (client_send_simple(&ctx, "DESCRIBE", ctx.parsed_url.url, "Accept: application/sdp\r\n", response,
+                           sizeof(response)) < 0) {
+        goto done;
+    }
+    track_count = parse_tracks_from_sdp(&ctx, response);
+    if (track_count < 0) {
+        goto done;
+    }
+
+    /* 每条发现到的 track 都分配独立的 interleaved 通道对。 */
+    for (size_t i = 0; i < sizeof(ctx.tracks) / sizeof(ctx.tracks[0]); ++i) {
+        struct client_track *track = &ctx.tracks[i];
+        if (!track->configured) {
+            continue;
+        }
+
+        track->rtp_channel = (uint8_t)(i * 2);
+        track->rtcp_channel = (uint8_t)(i * 2 + 1);
+        if (ctx.session_id[0] == '\0') {
+            snprintf(headers, sizeof(headers), "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u\r\n",
+                     track->rtp_channel, track->rtcp_channel);
+        } else {
+            snprintf(headers, sizeof(headers),
+                     "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u\r\n"
+                     "Session: %s\r\n",
+                     track->rtp_channel, track->rtcp_channel, ctx.session_id);
+        }
+        if (client_send_simple(&ctx, "SETUP", track->control_url, headers, response, sizeof(response)) < 0) {
+            goto done;
+        }
+        if (ctx.session_id[0] == '\0' &&
+            parse_session_id(response, ctx.session_id, sizeof(ctx.session_id)) < 0) {
+            goto done;
+        }
+    }
+
+    snprintf(headers, sizeof(headers), "Session: %s\r\n", ctx.session_id);
+    if (client_send_simple(&ctx, "PLAY", ctx.parsed_url.url, headers, response, sizeof(response)) < 0) {
+        goto done;
+    }
+
+    rc = receive_stream_loop(&ctx, config->running);
+
+done:
+    if (ctx.fd >= 0 && ctx.session_id[0] != '\0') {
+        snprintf(headers, sizeof(headers), "Session: %s\r\n", ctx.session_id);
+        client_send_simple(&ctx, "TEARDOWN", ctx.parsed_url.url, headers, response, sizeof(response));
+    }
+    if (ctx.fd >= 0) {
+        close(ctx.fd);
+    }
+    for (size_t i = 0; i < sizeof(ctx.tracks) / sizeof(ctx.tracks[0]); ++i) {
+        free(ctx.tracks[i].fu_buf);
+    }
+    return rc;
+}

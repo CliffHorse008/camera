@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+compile_commands.json
+rtsp_h264_server
+rtsp_h264_client_demo
