@@ -1,0 +1,10 @@
+.git
+.gitignore
+build/*
+!build/rtsp_h264_server
+build_no_ffmpeg
+cmake-build-*
+*.o
+*.a
+*.so
+*.out

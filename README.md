@@ -29,6 +29,37 @@ cmake -S . -B build -DRTSP_ENABLE_FFMPEG_INPUT=OFF
 cmake --build build
 ```
 
+## Docker
+
+先在本地编译出 `server` 可执行文件：
+
+```bash
+cmake -S . -B build -DRTSP_ENABLE_FFMPEG_INPUT=ON
+cmake --build build --target rtsp_h264_server
+```
+
+构建仅包含 `server` 的镜像：
+
+```bash
+docker build -t rtsp-h264-server .
+```
+
+Docker 镜像默认启用 `MP4` 输入支持，并在镜像内安装 `ffmpeg/ffprobe`。
+
+运行示例：
+
+```bash
+docker run --rm -p 5554:5554/tcp -p 5554:5554/udp rtsp-h264-server
+```
+
+挂载本地媒体文件作为输入：
+
+```bash
+docker run --rm -p 5554:5554/tcp -p 5554:5554/udp \
+  -v /path/to/media:/media \
+  rtsp-h264-server --input /media/input.mp4
+```
+
 ## 运行
 
 ```bash
