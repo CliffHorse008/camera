@@ -58,6 +58,9 @@ struct server_session {
     pthread_t sender_thread;
     pthread_mutex_t write_lock;
     double audio_phase;
+    size_t audio_offset;
+    size_t frame_index;
+    uint64_t audio_packet_accumulator;
 };
 
 static int open_udp_socket(uint16_t *bound_port) {
@@ -236,18 +239,48 @@ static int fill_pcm_payload(struct server_session *session, uint8_t *payload, si
     return 0;
 }
 
+static int fill_audio_payload(struct server_session *session, uint8_t *payload, size_t payload_size) {
+    if (session->stream->audio_data != NULL && session->stream->audio_size > 0) {
+        size_t copied = 0;
+
+        while (copied < payload_size) {
+            size_t remain = session->stream->audio_size - session->audio_offset;
+            size_t chunk = payload_size - copied;
+            if (remain == 0) {
+                session->audio_offset = 0;
+                remain = session->stream->audio_size;
+            }
+            if (chunk > remain) {
+                chunk = remain;
+            }
+            memcpy(payload + copied, session->stream->audio_data + session->audio_offset, chunk);
+            copied += chunk;
+            session->audio_offset += chunk;
+            if (session->audio_offset >= session->stream->audio_size) {
+                session->audio_offset = 0;
+            }
+        }
+        return 0;
+    }
+
+    return fill_pcm_payload(session, payload, payload_size);
+}
+
 static void *sender_thread_main(void *arg) {
     struct server_session *session = (struct server_session *)arg;
     struct rtsp_h264_nal_unit nals[64];
-    size_t nal_count =
-        rtsp_h264_parse_nals_from_buffer(session->stream->data, session->stream->size, nals, 64);
-    useconds_t frame_sleep_us = 1000000 / STREAM_FPS;
-    uint32_t frame_ts_step = RTP_CLOCK_H264 / STREAM_FPS;
+    uint32_t fps_num = session->stream->video_fps_num > 0 ? session->stream->video_fps_num : STREAM_FPS;
+    uint32_t fps_den = session->stream->video_fps_den > 0 ? session->stream->video_fps_den : 1;
+    useconds_t frame_sleep_us = (useconds_t)(((uint64_t)1000000 * fps_den) / fps_num);
+    uint32_t frame_ts_step = (uint32_t)(((uint64_t)RTP_CLOCK_H264 * fps_den) / fps_num);
+    uint64_t audio_packet_threshold = (uint64_t)fps_num * AUDIO_SAMPLES_PER_PACKET;
     uint8_t audio_payload[AUDIO_SAMPLES_PER_PACKET * 2];
 
     while (!session->stop_sender) {
-        /* 循环发送同一组编码帧，并并行合成音频。 */
-        if (session->video_track.configured) {
+        if (session->video_track.configured && session->stream->frame_count > 0) {
+            const struct rtsp_h264_frame *frame = &session->stream->frames[session->frame_index];
+            size_t nal_count = rtsp_h264_parse_nals_from_buffer(frame->data, frame->size, nals, 64);
+
             for (size_t i = 0; i < nal_count; ++i) {
                 if (session->stop_sender) {
                     break;
@@ -258,18 +291,20 @@ static void *sender_thread_main(void *arg) {
                 }
             }
             session->video_track.timestamp += frame_ts_step;
+            session->frame_index = (session->frame_index + 1) % session->stream->frame_count;
         }
 
-        if (session->audio_track.configured) {
-            /* 25fps 对应每轮 40ms，因此这里补两包 20ms PCM。 */
-            for (int i = 0; i < 2 && !session->stop_sender; ++i) {
-                fill_pcm_payload(session, audio_payload, sizeof(audio_payload));
+        if (session->audio_track.configured && session->stream->has_audio_track) {
+            session->audio_packet_accumulator += (uint64_t)AUDIO_SAMPLE_RATE * fps_den;
+            while (session->audio_packet_accumulator >= audio_packet_threshold && !session->stop_sender) {
+                fill_audio_payload(session, audio_payload, sizeof(audio_payload));
                 if (send_rtp_packet(session, &session->audio_track, audio_payload, sizeof(audio_payload),
                                     0) < 0) {
                     session->stop_sender = 1;
                     break;
                 }
                 session->audio_track.timestamp += AUDIO_SAMPLES_PER_PACKET;
+                session->audio_packet_accumulator -= audio_packet_threshold;
             }
         }
 
@@ -316,26 +351,35 @@ static int handle_options(struct server_session *session, int cseq) {
 static int handle_describe(struct server_session *session, int cseq, const char *url) {
     char sdp[1024];
     char resp[RTSP_MAX_MESSAGE];
-    /* 在 SDP 中同时暴露一条视频轨和一条 PCM 音频轨。 */
-    snprintf(sdp, sizeof(sdp),
-             "v=0\r\n"
-             "o=- 0 0 IN IP4 0.0.0.0\r\n"
-             "s=%s\r\n"
-             "t=0 0\r\n"
-             "a=control:*\r\n"
-             "m=video 0 RTP/AVP 96\r\n"
-             "c=IN IP4 0.0.0.0\r\n"
-             "a=rtpmap:96 H264/90000\r\n"
-             "a=fmtp:96 packetization-mode=1;profile-level-id=%s;sprop-parameter-sets=%s\r\n"
-             "a=control:trackID=0\r\n"
-             "m=audio 0 RTP/AVP 97\r\n"
-             "c=IN IP4 0.0.0.0\r\n"
-             "a=rtpmap:97 L16/8000/1\r\n"
-             "a=control:trackID=1\r\n"
-             "a=ptime:20\r\n"
-             "a=maxptime:20\r\n",
-             session->stream->stream_name, session->stream->profile_level_id,
-             session->stream->sprop_parameter_sets);
+    int len = snprintf(sdp, sizeof(sdp),
+                       "v=0\r\n"
+                       "o=- 0 0 IN IP4 0.0.0.0\r\n"
+                       "s=%s\r\n"
+                       "t=0 0\r\n"
+                       "a=control:*\r\n"
+                       "m=video 0 RTP/AVP 96\r\n"
+                       "c=IN IP4 0.0.0.0\r\n"
+                       "a=rtpmap:96 H264/90000\r\n"
+                       "a=fmtp:96 packetization-mode=1;profile-level-id=%s;sprop-parameter-sets=%s\r\n"
+                       "a=control:trackID=0\r\n",
+                       session->stream->stream_name, session->stream->profile_level_id,
+                       session->stream->sprop_parameter_sets);
+
+    if (len < 0 || (size_t)len >= sizeof(sdp)) {
+        return -1;
+    }
+    if (session->stream->has_audio_track) {
+        len += snprintf(sdp + len, sizeof(sdp) - (size_t)len,
+                        "m=audio 0 RTP/AVP 97\r\n"
+                        "c=IN IP4 0.0.0.0\r\n"
+                        "a=rtpmap:97 L16/8000/1\r\n"
+                        "a=control:trackID=1\r\n"
+                        "a=ptime:20\r\n"
+                        "a=maxptime:20\r\n");
+        if (len < 0 || (size_t)len >= sizeof(sdp)) {
+            return -1;
+        }
+    }
 
     snprintf(resp, sizeof(resp),
              "RTSP/1.0 200 OK\r\n"
@@ -401,6 +445,7 @@ static int setup_track_transport(struct server_session *session, struct media_tr
 static int handle_setup(struct server_session *session, int cseq, const char *req, const char *url) {
     struct transport_info transport;
     struct media_track *track = NULL;
+    int is_audio_track = strstr(url, "trackID=1") != NULL;
 
     if (parse_transport_header(req, &transport) < 0) {
         char resp[RTSP_MAX_MESSAGE];
@@ -413,8 +458,17 @@ static int handle_setup(struct server_session *session, int cseq, const char *re
     }
 
     stop_sender(session);
+    if (is_audio_track && !session->stream->has_audio_track) {
+        char resp[RTSP_MAX_MESSAGE];
+        snprintf(resp, sizeof(resp),
+                 "RTSP/1.0 404 Not Found\r\n"
+                 "CSeq: %d\r\n"
+                 "\r\n",
+                 cseq);
+        return session_send_response(session, resp);
+    }
     /* trackID=0 表示视频，trackID=1 表示音频。 */
-    track = strstr(url, "trackID=1") != NULL ? &session->audio_track : &session->video_track;
+    track = is_audio_track ? &session->audio_track : &session->video_track;
     return setup_track_transport(session, track, &transport, cseq);
 }
 
@@ -424,16 +478,28 @@ static int handle_play(struct server_session *session, int cseq, const char *url
         return -1;
     }
     /* 在 RTP-Info 中返回两条 track 的初始 RTP 状态。 */
-    snprintf(resp, sizeof(resp),
-             "RTSP/1.0 200 OK\r\n"
-             "CSeq: %d\r\n"
-             "Session: %u\r\n"
-             "Range: npt=0.000-\r\n"
-             "RTP-Info: url=%s/trackID=0;seq=%u;rtptime=%u,url=%s/trackID=1;seq=%u;rtptime=%u\r\n"
-             "\r\n",
-             cseq, session->session_id, url, session->video_track.seq,
-             session->video_track.timestamp, url, session->audio_track.seq,
-             session->audio_track.timestamp);
+    if (session->stream->has_audio_track) {
+        snprintf(resp, sizeof(resp),
+                 "RTSP/1.0 200 OK\r\n"
+                 "CSeq: %d\r\n"
+                 "Session: %u\r\n"
+                 "Range: npt=0.000-\r\n"
+                 "RTP-Info: url=%s/trackID=0;seq=%u;rtptime=%u,url=%s/trackID=1;seq=%u;rtptime=%u\r\n"
+                 "\r\n",
+                 cseq, session->session_id, url, session->video_track.seq,
+                 session->video_track.timestamp, url, session->audio_track.seq,
+                 session->audio_track.timestamp);
+    } else {
+        snprintf(resp, sizeof(resp),
+                 "RTSP/1.0 200 OK\r\n"
+                 "CSeq: %d\r\n"
+                 "Session: %u\r\n"
+                 "Range: npt=0.000-\r\n"
+                 "RTP-Info: url=%s/trackID=0;seq=%u;rtptime=%u\r\n"
+                 "\r\n",
+                 cseq, session->session_id, url, session->video_track.seq,
+                 session->video_track.timestamp);
+    }
     return session_send_response(session, resp);
 }
 
