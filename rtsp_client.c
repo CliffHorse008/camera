@@ -20,6 +20,14 @@ struct client_track {
     uint8_t payload_type;
     uint8_t rtp_channel;
     uint8_t rtcp_channel;
+    uint32_t clock_rate;
+    uint32_t first_rtp_timestamp;
+    int first_rtp_timestamp_set;
+    uint8_t sps[128];
+    size_t sps_size;
+    uint8_t pps[128];
+    size_t pps_size;
+    int codec_config_sent;
     uint8_t *fu_buf;
     size_t fu_size;
     size_t fu_cap;
@@ -35,8 +43,18 @@ struct rtsp_client_ctx {
     size_t rx_len;
     struct client_track tracks[2];
     rtsp_client_frame_callback on_frame;
+    rtsp_client_frame_callback_ex on_frame_ex;
     void *user_data;
 };
+
+static void client_emit_frame(struct rtsp_client_ctx *ctx, enum rtsp_client_media_type media_type,
+                              const uint8_t *data, size_t data_size, uint64_t pts90k) {
+    if (ctx->on_frame_ex != NULL) {
+        ctx->on_frame_ex(media_type, data, data_size, pts90k, ctx->user_data);
+    } else if (ctx->on_frame != NULL) {
+        ctx->on_frame(media_type, data, data_size, ctx->user_data);
+    }
+}
 
 static int client_send_request(struct rtsp_client_ctx *ctx, const char *request) {
     return rtsp_send_all(ctx->fd, request, strlen(request));
@@ -148,6 +166,117 @@ static int client_send_simple(struct rtsp_client_ctx *ctx, const char *method, c
     return client_read_response(ctx, response, response_size);
 }
 
+static int decode_base64_char(char ch) {
+    if (ch >= 'A' && ch <= 'Z') {
+        return ch - 'A';
+    }
+    if (ch >= 'a' && ch <= 'z') {
+        return ch - 'a' + 26;
+    }
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0' + 52;
+    }
+    if (ch == '+') {
+        return 62;
+    }
+    if (ch == '/') {
+        return 63;
+    }
+    return -1;
+}
+
+static int decode_base64(const char *src, uint8_t *out, size_t out_cap, size_t *out_size) {
+    uint32_t accumulator = 0;
+    int bits = 0;
+    size_t used = 0;
+
+    for (const char *p = src; *p != '\0'; ++p) {
+        int value = 0;
+        if (*p == '=') {
+            break;
+        }
+        value = decode_base64_char(*p);
+        if (value < 0) {
+            return -1;
+        }
+        accumulator = (accumulator << 6) | (uint32_t)value;
+        bits += 6;
+        while (bits >= 8) {
+            bits -= 8;
+            if (used >= out_cap) {
+                return -1;
+            }
+            out[used++] = (uint8_t)((accumulator >> bits) & 0xff);
+        }
+    }
+
+    *out_size = used;
+    return used > 0 ? 0 : -1;
+}
+
+static int parse_sprop_parameter_sets(struct client_track *track, const char *line, size_t len) {
+    const char *key = "sprop-parameter-sets=";
+    const char *pos = NULL;
+    const char *value = NULL;
+    const char *comma = NULL;
+    size_t first_len = 0;
+    size_t second_len = 0;
+    char first[256];
+    char second[256];
+
+    pos = strstr(line, key);
+    if (pos == NULL || (size_t)(pos - line) >= len) {
+        return 0;
+    }
+    value = pos + strlen(key);
+    comma = memchr(value, ',', len - (size_t)(value - line));
+    if (comma == NULL) {
+        return -1;
+    }
+
+    first_len = (size_t)(comma - value);
+    if (first_len == 0 || first_len >= sizeof(first)) {
+        return -1;
+    }
+
+    {
+        const char *end = line + len;
+        const char *tail = comma + 1;
+        while (tail < end && *tail != ';' && *tail != '\r' && *tail != '\n') {
+            ++tail;
+        }
+        second_len = (size_t)(tail - (comma + 1));
+    }
+    if (second_len == 0 || second_len >= sizeof(second)) {
+        return -1;
+    }
+
+    memcpy(first, value, first_len);
+    first[first_len] = '\0';
+    memcpy(second, comma + 1, second_len);
+    second[second_len] = '\0';
+
+    if (decode_base64(first, track->sps, sizeof(track->sps), &track->sps_size) < 0 ||
+        decode_base64(second, track->pps, sizeof(track->pps), &track->pps_size) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int emit_video_codec_config(struct rtsp_client_ctx *ctx, struct client_track *track) {
+    if (track->media_type != RTSP_CLIENT_MEDIA_VIDEO || track->codec_config_sent) {
+        return 0;
+    }
+    if (track->sps_size > 0) {
+        client_emit_frame(ctx, RTSP_CLIENT_MEDIA_VIDEO, track->sps, track->sps_size, 0);
+    }
+    if (track->pps_size > 0) {
+        client_emit_frame(ctx, RTSP_CLIENT_MEDIA_VIDEO, track->pps, track->pps_size, 0);
+    }
+    track->codec_config_sent = 1;
+    return 0;
+}
+
 static int parse_session_id(const char *response, char *out, size_t out_size) {
     char value[128];
     char *semi = NULL;
@@ -210,10 +339,12 @@ static int parse_tracks_from_sdp(struct rtsp_client_ctx *ctx, const char *descri
                     current = &ctx->tracks[track_count++];
                     current->media_type = RTSP_CLIENT_MEDIA_VIDEO;
                     current->payload_type = (uint8_t)payload_type;
+                    current->clock_rate = 90000;
                 } else if (strcmp(media, "audio") == 0 && track_count < 2) {
                     current = &ctx->tracks[track_count++];
                     current->media_type = RTSP_CLIENT_MEDIA_AUDIO;
                     current->payload_type = (uint8_t)payload_type;
+                    current->clock_rate = 8000;
                 } else {
                     current = NULL;
                 }
@@ -230,6 +361,11 @@ static int parse_tracks_from_sdp(struct rtsp_client_ctx *ctx, const char *descri
                 return -1;
             }
             current->configured = 1;
+        } else if (current != NULL && current->media_type == RTSP_CLIENT_MEDIA_VIDEO && len > 7 &&
+                   strncmp(line, "a=fmtp:", 7) == 0) {
+            if (parse_sprop_parameter_sets(current, line, len) < 0) {
+                return -1;
+            }
         }
 
         if (line_end == NULL) {
@@ -242,7 +378,7 @@ static int parse_tracks_from_sdp(struct rtsp_client_ctx *ctx, const char *descri
 }
 
 static int handle_rtp_payload(struct rtsp_client_ctx *ctx, struct client_track *track,
-                              const uint8_t *payload, size_t payload_size) {
+                              const uint8_t *payload, size_t payload_size, uint64_t pts90k) {
     uint8_t nal_type = 0;
     if (payload_size == 0) {
         return 0;
@@ -250,14 +386,17 @@ static int handle_rtp_payload(struct rtsp_client_ctx *ctx, struct client_track *
 
     if (track->media_type == RTSP_CLIENT_MEDIA_AUDIO) {
         /* PCM 数据一包 RTP 就是完整负载，直接上抛。 */
-        ctx->on_frame(RTSP_CLIENT_MEDIA_AUDIO, payload, payload_size, ctx->user_data);
+        client_emit_frame(ctx, RTSP_CLIENT_MEDIA_AUDIO, payload, payload_size, pts90k);
         return 0;
     }
 
     /* 单 NAL RTP 包可直接回调给上层。 */
     nal_type = (uint8_t)(payload[0] & 0x1f);
     if (nal_type >= 1 && nal_type <= 23) {
-        ctx->on_frame(RTSP_CLIENT_MEDIA_VIDEO, payload, payload_size, ctx->user_data);
+        if (emit_video_codec_config(ctx, track) < 0) {
+            return -1;
+        }
+        client_emit_frame(ctx, RTSP_CLIENT_MEDIA_VIDEO, payload, payload_size, pts90k);
         return 0;
     }
 
@@ -286,7 +425,10 @@ static int handle_rtp_payload(struct rtsp_client_ctx *ctx, struct client_track *
         track->fu_size += chunk_size;
 
         if (end) {
-            ctx->on_frame(RTSP_CLIENT_MEDIA_VIDEO, track->fu_buf, track->fu_size, ctx->user_data);
+            if (emit_video_codec_config(ctx, track) < 0) {
+                return -1;
+            }
+            client_emit_frame(ctx, RTSP_CLIENT_MEDIA_VIDEO, track->fu_buf, track->fu_size, pts90k);
             track->fu_size = 0;
         }
     }
@@ -302,6 +444,8 @@ static int handle_interleaved_frame(struct rtsp_client_ctx *ctx) {
     uint16_t size = 0;
     uint8_t cc = 0;
     int extension = 0;
+    uint32_t rtp_timestamp = 0;
+    uint64_t pts90k = 0;
 
     /* RTSP over TCP 的复用帧以 '$' + 通道号 + 16 位长度开头。 */
     if (client_read_exact(ctx, prefix, sizeof(prefix)) < 0) {
@@ -339,6 +483,8 @@ static int handle_interleaved_frame(struct rtsp_client_ctx *ctx) {
     }
 
     /* 跳过 RTP 的 CSRC 和扩展头，定位真正的媒体负载。 */
+    rtp_timestamp = ((uint32_t)packet[4] << 24) | ((uint32_t)packet[5] << 16) | ((uint32_t)packet[6] << 8) |
+                    (uint32_t)packet[7];
     cc = (uint8_t)(packet[0] & 0x0f);
     extension = (packet[0] & 0x10) != 0;
     payload_offset += (size_t)cc * 4;
@@ -355,7 +501,17 @@ static int handle_interleaved_frame(struct rtsp_client_ctx *ctx) {
         return -1;
     }
 
-    if (handle_rtp_payload(ctx, track, packet + payload_offset, size - payload_offset) < 0) {
+    if (track->clock_rate == 0) {
+        track->clock_rate = track->media_type == RTSP_CLIENT_MEDIA_AUDIO ? 8000 : 90000;
+    }
+    if (!track->first_rtp_timestamp_set) {
+        track->first_rtp_timestamp = rtp_timestamp;
+        track->first_rtp_timestamp_set = 1;
+    }
+    pts90k = ((uint64_t)((uint32_t)(rtp_timestamp - track->first_rtp_timestamp)) * 90000ULL) /
+             (uint64_t)track->clock_rate;
+
+    if (handle_rtp_payload(ctx, track, packet + payload_offset, size - payload_offset, pts90k) < 0) {
         free(packet);
         return -1;
     }
@@ -395,13 +551,14 @@ int rtsp_client_run(const struct rtsp_client_config *config) {
     int track_count = 0;
     int rc = -1;
 
-    if (config == NULL || config->url == NULL || config->on_frame == NULL) {
+    if (config == NULL || config->url == NULL || (config->on_frame == NULL && config->on_frame_ex == NULL)) {
         return -1;
     }
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.fd = -1;
     ctx.on_frame = config->on_frame;
+    ctx.on_frame_ex = config->on_frame_ex;
     ctx.user_data = config->user_data;
 
     if (rtsp_parse_url(config->url, &ctx.parsed_url) < 0) {

@@ -12,10 +12,13 @@ enum rtsp_client_media_type {
 
 typedef void (*rtsp_client_frame_callback)(enum rtsp_client_media_type media_type, const uint8_t *data,
                                            size_t data_size, void *user_data);
+typedef void (*rtsp_client_frame_callback_ex)(enum rtsp_client_media_type media_type, const uint8_t *data,
+                                              size_t data_size, uint64_t pts90k, void *user_data);
 
 struct rtsp_client_config {
     const char *url;
     rtsp_client_frame_callback on_frame;
+    rtsp_client_frame_callback_ex on_frame_ex;
     void *user_data;
     const volatile sig_atomic_t *running;
 };

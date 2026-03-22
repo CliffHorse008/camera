@@ -108,8 +108,25 @@ ffplay -rtsp_transport tcp rtsp://127.0.0.1:5554/live
 
 ## Client 示例
 
-客户端示例默认使用 RTSP over TCP 拉流，并在回调中区分打印视频和音频：
+客户端示例默认使用 RTSP over TCP 拉流，并用内置的最小 `MPEG-TS/HLS` 骨架直接写出 `TS` 切片，同时同步更新 `playlist.m3u8`。视频按关键帧切片，音频会把 `L16/8000/1 PCM` 实时编码成 `AAC` 后一起复用进 `TS`：
 
 ```bash
 ./build/rtsp_h264_client_demo rtsp://127.0.0.1:5554/live
 ```
+
+也可以显式指定输出目录：
+
+```bash
+./build/rtsp_h264_client_demo rtsp://127.0.0.1:5554/live ./segments
+```
+
+因为切片点会对齐到 `IDR` 关键帧，所以如果源流 `GOP` 比较长，实际分片时长可能会大于 `2` 秒。
+
+如果目标平台没有 `libavcodec/libavutil/libswresample`，可以在构建时关闭客户端 AAC 支持：
+
+```bash
+cmake -S . -B build -DRTSP_ENABLE_LIBAV_AAC=OFF
+cmake --build build --target rtsp_h264_client_demo
+```
+
+关闭后客户端仍会生成视频 `TS/HLS`，但收到 `PCM` 音频时只会打印一次告警并忽略，不做 `PCM -> AAC` 转换。
