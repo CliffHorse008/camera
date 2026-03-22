@@ -31,6 +31,8 @@ struct rtsp_client_ctx {
     int cseq;
     char session_id[128];
     struct rtsp_url parsed_url;
+    uint8_t rx_buf[RTSP_MAX_MESSAGE * 4 + 1];
+    size_t rx_len;
     struct client_track tracks[2];
     rtsp_client_frame_callback on_frame;
     void *user_data;
@@ -40,10 +42,94 @@ static int client_send_request(struct rtsp_client_ctx *ctx, const char *request)
     return rtsp_send_all(ctx->fd, request, strlen(request));
 }
 
+static int client_fill_buffer(struct rtsp_client_ctx *ctx, size_t need) {
+    while (ctx->rx_len < need) {
+        ssize_t n = recv(ctx->fd, ctx->rx_buf + ctx->rx_len, sizeof(ctx->rx_buf) - ctx->rx_len, 0);
+        if (n == 0) {
+            return -1;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        ctx->rx_len += (size_t)n;
+        if (ctx->rx_len == sizeof(ctx->rx_buf) && ctx->rx_len < need) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void client_consume_buffer(struct rtsp_client_ctx *ctx, size_t n) {
+    if (n >= ctx->rx_len) {
+        ctx->rx_len = 0;
+        return;
+    }
+    memmove(ctx->rx_buf, ctx->rx_buf + n, ctx->rx_len - n);
+    ctx->rx_len -= n;
+}
+
+static int client_peek_byte(struct rtsp_client_ctx *ctx, uint8_t *out) {
+    if (client_fill_buffer(ctx, 1) < 0) {
+        return -1;
+    }
+    *out = ctx->rx_buf[0];
+    return 0;
+}
+
+static int client_read_exact(struct rtsp_client_ctx *ctx, void *buf, size_t len) {
+    uint8_t *out = (uint8_t *)buf;
+
+    if (client_fill_buffer(ctx, len) < 0) {
+        return -1;
+    }
+    memcpy(out, ctx->rx_buf, len);
+    client_consume_buffer(ctx, len);
+    return 0;
+}
+
 static int client_read_response(struct rtsp_client_ctx *ctx, char *buf, size_t cap) {
-    size_t len = 0;
-    (void)ctx;
-    return rtsp_read_message(ctx->fd, buf, cap, &len);
+    char *headers_end = NULL;
+    size_t message_len = 0;
+    int content_length = 0;
+
+    if (cap == 0) {
+        return -1;
+    }
+
+    for (;;) {
+        if (ctx->rx_len > 0) {
+            ctx->rx_buf[ctx->rx_len] = '\0';
+            headers_end = strstr((char *)ctx->rx_buf, "\r\n\r\n");
+            if (headers_end != NULL) {
+                content_length = rtsp_find_content_length((char *)ctx->rx_buf);
+                message_len = (size_t)(headers_end + 4 - (char *)ctx->rx_buf) + (size_t)content_length;
+                if (message_len > ctx->rx_len) {
+                    if (message_len >= sizeof(ctx->rx_buf)) {
+                        return -1;
+                    }
+                } else {
+                    break;
+                }
+            } else if (ctx->rx_len + 1 >= sizeof(ctx->rx_buf)) {
+                return -1;
+            }
+        }
+
+        if (client_fill_buffer(ctx, ctx->rx_len + 1) < 0) {
+            return -1;
+        }
+    }
+
+    if (message_len + 1 > cap) {
+        return -1;
+    }
+    memcpy(buf, ctx->rx_buf, message_len);
+    buf[message_len] = '\0';
+    client_consume_buffer(ctx, message_len);
+    return 0;
 }
 
 static int client_send_simple(struct rtsp_client_ctx *ctx, const char *method, const char *url,
@@ -218,7 +304,7 @@ static int handle_interleaved_frame(struct rtsp_client_ctx *ctx) {
     int extension = 0;
 
     /* RTSP over TCP 的复用帧以 '$' + 通道号 + 16 位长度开头。 */
-    if (rtsp_recv_exact(ctx->fd, prefix, sizeof(prefix)) < 0) {
+    if (client_read_exact(ctx, prefix, sizeof(prefix)) < 0) {
         return -1;
     }
     size = (uint16_t)((prefix[2] << 8) | prefix[3]);
@@ -226,7 +312,7 @@ static int handle_interleaved_frame(struct rtsp_client_ctx *ctx) {
     if (packet == NULL) {
         return -1;
     }
-    if (rtsp_recv_exact(ctx->fd, packet, size) < 0) {
+    if (client_read_exact(ctx, packet, size) < 0) {
         free(packet);
         return -1;
     }
@@ -281,18 +367,20 @@ static int handle_interleaved_frame(struct rtsp_client_ctx *ctx) {
 static int receive_stream_loop(struct rtsp_client_ctx *ctx, const volatile sig_atomic_t *running) {
     while (running == NULL || *running) {
         uint8_t ch = 0;
-        ssize_t n = recv(ctx->fd, &ch, 1, MSG_PEEK);
-        if (n <= 0) {
+        if (client_peek_byte(ctx, &ch) < 0) {
+            printf("recv error: %s\n", strerror(errno));
             return -1;
         }
         if (ch == '$') {
             if (handle_interleaved_frame(ctx) < 0) {
+                printf("handle interleaved frame fail\n");
                 return -1;
             }
         } else {
             /* 如果服务端发来异步 RTSP 响应，这里把它消费掉。 */
             char response[RTSP_MAX_MESSAGE];
             if (client_read_response(ctx, response, sizeof(response)) < 0) {
+                printf("read response fail, first byte=0x%02x errno=%s\n", ch, strerror(errno));
                 return -1;
             }
         }
