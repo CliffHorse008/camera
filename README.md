@@ -96,11 +96,4 @@ ffplay -rtsp_transport tcp rtsp://127.0.0.1:5554/live
 
 因为切片点会对齐到 `IDR` 关键帧，所以如果源流 `GOP` 比较长，实际分片时长可能会大于 `2` 秒。
 
-如果目标平台没有 `libavcodec/libavutil/libswresample`，可以在构建时关闭客户端 AAC 支持：
-
-```bash
-cmake -S . -B build -DRTSP_ENABLE_LIBAV_AAC=OFF
-cmake --build build --target rtsp_h264_client_demo
-```
-
-关闭后客户端仍会生成视频 `TS/HLS`，但如果后续接入的源流需要本地音频转码能力，相关处理将不可用。
+客户端不会再做本地 `PCM -> AAC` 转码，而是直接复用 RTSP 拉下来的 `AAC` 音频。如果遇到不支持的音频格式，会打印告警并忽略音频轨。

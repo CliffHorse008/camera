@@ -8,15 +8,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#if defined(RTSP_HAS_LIBAV_AAC)
-#include <libavcodec/avcodec.h>
-#include <libavutil/avutil.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/opt.h>
-#include <libavutil/samplefmt.h>
-#include <libswresample/swresample.h>
-#endif
-
 #define TS_PACKET_SIZE 188
 #define TS_PAT_PID 0x0000
 #define TS_PMT_PID 0x1000
@@ -26,135 +17,9 @@
 #define TS_STREAM_TYPE_H264 0x1B
 #define TS_PROGRAM_NUMBER 1
 #define TS_MAX_SEGMENTS 1024
-#if defined(RTSP_HAS_LIBAV_AAC)
 #define TS_AUDIO_PID 0x0101
 #define TS_STREAM_ID_AUDIO 0xC0
 #define TS_STREAM_TYPE_AAC 0x0F
-#define AUDIO_SAMPLE_RATE 8000
-#define AUDIO_CHANNELS 1
-#define AUDIO_PCM_BYTES_PER_SAMPLE 2
-#endif
-
-#if defined(RTSP_HAS_LIBAV_AAC)
-static int init_aac_encoder(struct rtsp_ts_muxer *muxer) {
-    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-    AVCodecContext *codec_ctx = NULL;
-    AVFrame *frame = NULL;
-    AVPacket *packet = NULL;
-    SwrContext *swr = NULL;
-    int rc = 0;
-
-    if (codec == NULL) {
-        errno = ENOSYS;
-        return -1;
-    }
-
-    codec_ctx = avcodec_alloc_context3(codec);
-    frame = av_frame_alloc();
-    packet = av_packet_alloc();
-    if (codec_ctx == NULL || frame == NULL || packet == NULL) {
-        rc = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    codec_ctx->sample_rate = AUDIO_SAMPLE_RATE;
-    codec_ctx->bit_rate = 32000;
-    codec_ctx->time_base = (AVRational){1, AUDIO_SAMPLE_RATE};
-    codec_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    codec_ctx->profile = FF_PROFILE_AAC_LOW;
-    av_channel_layout_default(&codec_ctx->ch_layout, AUDIO_CHANNELS);
-
-    rc = avcodec_open2(codec_ctx, codec, NULL);
-    if (rc < 0) {
-        goto fail;
-    }
-
-    frame->nb_samples = codec_ctx->frame_size;
-    frame->format = codec_ctx->sample_fmt;
-    frame->sample_rate = codec_ctx->sample_rate;
-    if (av_channel_layout_copy(&frame->ch_layout, &codec_ctx->ch_layout) < 0) {
-        rc = AVERROR(EINVAL);
-        goto fail;
-    }
-    if (av_frame_get_buffer(frame, 0) < 0) {
-        rc = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    swr = swr_alloc();
-    if (swr == NULL) {
-        rc = AVERROR(ENOMEM);
-        goto fail;
-    }
-    av_opt_set_chlayout(swr, "in_chlayout", &codec_ctx->ch_layout, 0);
-    av_opt_set_int(swr, "in_sample_rate", AUDIO_SAMPLE_RATE, 0);
-    av_opt_set_sample_fmt(swr, "in_sample_fmt", AV_SAMPLE_FMT_S16, 0);
-    av_opt_set_chlayout(swr, "out_chlayout", &codec_ctx->ch_layout, 0);
-    av_opt_set_int(swr, "out_sample_rate", codec_ctx->sample_rate, 0);
-    av_opt_set_sample_fmt(swr, "out_sample_fmt", codec_ctx->sample_fmt, 0);
-    if (swr_init(swr) < 0) {
-        rc = AVERROR(EINVAL);
-        goto fail;
-    }
-
-    muxer->aac_codec_ctx = codec_ctx;
-    muxer->aac_frame = frame;
-    muxer->aac_packet = packet;
-    muxer->aac_swr_ctx = swr;
-    muxer->audio_ready = 1;
-    return 0;
-
-fail:
-    if (frame != NULL) {
-        av_frame_free(&frame);
-    }
-    if (packet != NULL) {
-        av_packet_free(&packet);
-    }
-    if (codec_ctx != NULL) {
-        avcodec_free_context(&codec_ctx);
-    }
-    if (swr != NULL) {
-        swr_free(&swr);
-    }
-    errno = EIO;
-    return -1;
-}
-
-static void close_aac_encoder(struct rtsp_ts_muxer *muxer) {
-    AVCodecContext *codec_ctx = (AVCodecContext *)muxer->aac_codec_ctx;
-    AVFrame *frame = (AVFrame *)muxer->aac_frame;
-    AVPacket *packet = (AVPacket *)muxer->aac_packet;
-    SwrContext *swr = (SwrContext *)muxer->aac_swr_ctx;
-
-    if (frame != NULL) {
-        av_frame_free(&frame);
-    }
-    if (packet != NULL) {
-        av_packet_free(&packet);
-    }
-    if (codec_ctx != NULL) {
-        avcodec_free_context(&codec_ctx);
-    }
-    if (swr != NULL) {
-        swr_free(&swr);
-    }
-    muxer->aac_codec_ctx = NULL;
-    muxer->aac_frame = NULL;
-    muxer->aac_packet = NULL;
-    muxer->aac_swr_ctx = NULL;
-    muxer->audio_ready = 0;
-}
-#else
-static int init_aac_encoder(struct rtsp_ts_muxer *muxer) {
-    (void)muxer;
-    return 0;
-}
-
-static void close_aac_encoder(struct rtsp_ts_muxer *muxer) {
-    (void)muxer;
-}
-#endif
 
 static uint32_t crc32_mpeg(const uint8_t *data, size_t size) {
     uint32_t crc = 0xffffffffU;
@@ -368,16 +233,12 @@ static int write_pmt(struct rtsp_ts_muxer *muxer) {
     section[used++] = (uint8_t)(TS_VIDEO_PID & 0xff);
     section[used++] = 0xF0;
     section[used++] = 0x00;
-#if defined(RTSP_HAS_LIBAV_AAC)
     section[used++] = TS_STREAM_TYPE_AAC;
     section[used++] = 0xE0 | ((TS_AUDIO_PID >> 8) & 0x1f);
     section[used++] = (uint8_t)(TS_AUDIO_PID & 0xff);
     section[used++] = 0xF0;
     section[used++] = 0x00;
     section[2] = 0x17;
-#else
-    section[2] = 0x12;
-#endif
     crc = crc32_mpeg(section, used);
     section[used++] = (uint8_t)(crc >> 24);
     section[used++] = (uint8_t)(crc >> 16);
@@ -499,9 +360,7 @@ static int open_segment(struct rtsp_ts_muxer *muxer, uint64_t start_pts) {
     muxer->pat_cc = 0;
     muxer->pmt_cc = 0;
     muxer->video_cc = 0;
-#if defined(RTSP_HAS_LIBAV_AAC)
     muxer->audio_cc = 0;
-#endif
 
     if (write_pat(muxer) < 0 || write_pmt(muxer) < 0) {
         fclose(muxer->segment_fp);
@@ -565,7 +424,6 @@ static int write_video_pes(struct rtsp_ts_muxer *muxer, const uint8_t *data, siz
     return 0;
 }
 
-#if defined(RTSP_HAS_LIBAV_AAC)
 static int write_pending_codec_config(struct rtsp_ts_muxer *muxer, uint64_t pts) {
     uint8_t config[512];
     size_t used = 0;
@@ -600,45 +458,14 @@ static int write_pending_codec_config(struct rtsp_ts_muxer *muxer, uint64_t pts)
 }
 
 static int write_audio_pes(struct rtsp_ts_muxer *muxer, const uint8_t *data, size_t size, uint64_t pts) {
-    AVCodecContext *codec_ctx = (AVCodecContext *)muxer->aac_codec_ctx;
     uint8_t header[32];
-    uint8_t adts[7];
     size_t header_size = 14;
     size_t payload_consumed = 0;
     size_t first_payload = 0;
     uint16_t pes_packet_length = 0;
-    size_t aac_size = size + sizeof(adts);
-    int sample_rate_index = 11;
-    int channel_config = codec_ctx != NULL ? codec_ctx->ch_layout.nb_channels : 1;
-    int profile = 1;
 
-    switch (codec_ctx != NULL ? codec_ctx->sample_rate : AUDIO_SAMPLE_RATE) {
-        case 96000: sample_rate_index = 0; break;
-        case 88200: sample_rate_index = 1; break;
-        case 64000: sample_rate_index = 2; break;
-        case 48000: sample_rate_index = 3; break;
-        case 44100: sample_rate_index = 4; break;
-        case 32000: sample_rate_index = 5; break;
-        case 24000: sample_rate_index = 6; break;
-        case 22050: sample_rate_index = 7; break;
-        case 16000: sample_rate_index = 8; break;
-        case 12000: sample_rate_index = 9; break;
-        case 11025: sample_rate_index = 10; break;
-        case 8000: sample_rate_index = 11; break;
-        case 7350: sample_rate_index = 12; break;
-    }
-
-    adts[0] = 0xFF;
-    adts[1] = 0xF1;
-    adts[2] = (uint8_t)(((profile & 0x03) << 6) | ((sample_rate_index & 0x0F) << 2) |
-                        ((channel_config >> 2) & 0x01));
-    adts[3] = (uint8_t)(((channel_config & 0x03) << 6) | ((aac_size >> 11) & 0x03));
-    adts[4] = (uint8_t)((aac_size >> 3) & 0xFF);
-    adts[5] = (uint8_t)(((aac_size & 0x07) << 5) | 0x1F);
-    adts[6] = 0xFC;
-
-    if (aac_size + 8 < 0xffff) {
-        pes_packet_length = (uint16_t)(aac_size + 8);
+    if (size + 8 < 0xffff) {
+        pes_packet_length = (uint16_t)(size + 8);
     }
 
     header[0] = 0x00;
@@ -653,15 +480,14 @@ static int write_audio_pes(struct rtsp_ts_muxer *muxer, const uint8_t *data, siz
     write_pts_field(header + 9, 0x02, pts);
 
     {
-        uint8_t *pes = (uint8_t *)malloc(header_size + aac_size);
-        size_t pes_size = header_size + aac_size;
+        uint8_t *pes = (uint8_t *)malloc(header_size + size);
+        size_t pes_size = header_size + size;
 
         if (pes == NULL) {
             return -1;
         }
         memcpy(pes, header, header_size);
-        memcpy(pes + header_size, adts, sizeof(adts));
-        memcpy(pes + header_size + sizeof(adts), data, size);
+        memcpy(pes + header_size, data, size);
 
         if (write_ts_packet(muxer->segment_fp, TS_AUDIO_PID, 1, muxer->audio_cc++, 0, 0, pes, pes_size,
                             &first_payload) < 0) {
@@ -683,123 +509,6 @@ static int write_audio_pes(struct rtsp_ts_muxer *muxer, const uint8_t *data, siz
 
     return 0;
 }
-
-static int ensure_pcm_capacity(struct rtsp_ts_muxer *muxer, size_t needed) {
-    uint8_t *new_buf = NULL;
-    size_t new_cap = muxer->pcm_cap == 0 ? 4096 : muxer->pcm_cap;
-
-    while (new_cap < needed) {
-        new_cap *= 2;
-    }
-    if (new_cap == muxer->pcm_cap) {
-        return 0;
-    }
-    new_buf = (uint8_t *)realloc(muxer->pcm_buf, new_cap);
-    if (new_buf == NULL) {
-        return -1;
-    }
-    muxer->pcm_buf = new_buf;
-    muxer->pcm_cap = new_cap;
-    return 0;
-}
-
-static int ensure_pcm_native_capacity(struct rtsp_ts_muxer *muxer, size_t needed) {
-    uint8_t *new_buf = NULL;
-    size_t new_cap = muxer->pcm_native_cap == 0 ? 4096 : muxer->pcm_native_cap;
-
-    while (new_cap < needed) {
-        new_cap *= 2;
-    }
-    if (new_cap == muxer->pcm_native_cap) {
-        return 0;
-    }
-    new_buf = (uint8_t *)realloc(muxer->pcm_native_buf, new_cap);
-    if (new_buf == NULL) {
-        return -1;
-    }
-    muxer->pcm_native_buf = new_buf;
-    muxer->pcm_native_cap = new_cap;
-    return 0;
-}
-
-static int drain_aac_packets(struct rtsp_ts_muxer *muxer) {
-    AVCodecContext *codec_ctx = (AVCodecContext *)muxer->aac_codec_ctx;
-    AVPacket *packet = (AVPacket *)muxer->aac_packet;
-
-    for (;;) {
-        int rc = avcodec_receive_packet(codec_ctx, packet);
-        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
-            return 0;
-        }
-        if (rc < 0) {
-            errno = EIO;
-            return -1;
-        }
-
-        if (!muxer->current_segment_open) {
-            av_packet_unref(packet);
-            continue;
-        }
-
-        if (write_audio_pes(muxer, packet->data, packet->size, muxer->audio_next_pts) < 0) {
-            av_packet_unref(packet);
-            return -1;
-        }
-        muxer->audio_frames++;
-        muxer->audio_next_pts += ((uint64_t)1024 * TS_PTS_HZ) / AUDIO_SAMPLE_RATE;
-        if (muxer->audio_next_pts > muxer->latest_pts) {
-            muxer->latest_pts = muxer->audio_next_pts;
-        }
-        av_packet_unref(packet);
-    }
-}
-
-static int encode_pending_audio(struct rtsp_ts_muxer *muxer) {
-    AVCodecContext *codec_ctx = (AVCodecContext *)muxer->aac_codec_ctx;
-    AVFrame *frame = (AVFrame *)muxer->aac_frame;
-    SwrContext *swr = (SwrContext *)muxer->aac_swr_ctx;
-    const size_t bytes_per_frame = (size_t)codec_ctx->frame_size * AUDIO_CHANNELS * AUDIO_PCM_BYTES_PER_SAMPLE;
-
-    while (muxer->pcm_size >= bytes_per_frame) {
-        const uint8_t *input[1];
-        int rc = 0;
-
-        if (ensure_pcm_native_capacity(muxer, bytes_per_frame) < 0) {
-            return -1;
-        }
-        for (size_t i = 0; i < bytes_per_frame; i += 2) {
-            muxer->pcm_native_buf[i] = muxer->pcm_buf[i + 1];
-            muxer->pcm_native_buf[i + 1] = muxer->pcm_buf[i];
-        }
-
-        if (av_frame_make_writable(frame) < 0) {
-            errno = EIO;
-            return -1;
-        }
-        input[0] = muxer->pcm_native_buf;
-        rc = swr_convert(swr, frame->data, frame->nb_samples, input, frame->nb_samples);
-        if (rc < 0) {
-            errno = EIO;
-            return -1;
-        }
-        frame->pts = (int64_t)muxer->audio_samples_encoded;
-        rc = avcodec_send_frame(codec_ctx, frame);
-        if (rc < 0) {
-            errno = EIO;
-            return -1;
-        }
-        if (drain_aac_packets(muxer) < 0) {
-            return -1;
-        }
-        muxer->audio_samples_encoded += (uint64_t)codec_ctx->frame_size;
-
-        memmove(muxer->pcm_buf, muxer->pcm_buf + bytes_per_frame, muxer->pcm_size - bytes_per_frame);
-        muxer->pcm_size -= bytes_per_frame;
-    }
-
-    return 0;
-}
-#endif
 
 static int read_ue(const uint8_t *data, size_t size, size_t *bit_offset, unsigned *value) {
     unsigned zeros = 0;
@@ -894,11 +603,9 @@ static int flush_access_unit(struct rtsp_ts_muxer *muxer) {
             }
         }
     }
-#if defined(RTSP_HAS_LIBAV_AAC)
     if (write_pending_codec_config(muxer, pts) < 0) {
         return -1;
     }
-#endif
     if (write_video_pes(muxer, muxer->au_buf, muxer->au_size, pts) < 0) {
         return -1;
     }
@@ -936,9 +643,6 @@ int rtsp_ts_muxer_init(struct rtsp_ts_muxer *muxer, const struct rtsp_ts_muxer_c
     }
 
     if (playlist_write(muxer, 0) < 0) {
-        return -1;
-    }
-    if (init_aac_encoder(muxer) < 0) {
         return -1;
     }
     return 0;
@@ -989,32 +693,32 @@ int rtsp_ts_muxer_write_video_nal(struct rtsp_ts_muxer *muxer, const uint8_t *na
 
 int rtsp_ts_muxer_write_audio_block_pts(struct rtsp_ts_muxer *muxer, const uint8_t *data, size_t size,
                                         uint64_t pts90k) {
-    if (muxer == NULL || data == NULL) {
+    uint64_t current_pts = 0;
+
+    if (muxer == NULL || data == NULL || size == 0) {
         errno = EINVAL;
         return -1;
     }
     muxer->audio_blocks++;
-#if !defined(RTSP_HAS_LIBAV_AAC)
-    (void)size;
-    if (!muxer->audio_warned_ignored) {
-        fprintf(stderr, "warning: libav AAC support not built, ignoring PCM audio blocks\n");
-        muxer->audio_warned_ignored = 1;
-    }
-    return 0;
-#else
     if (!muxer->first_pts_set) {
         muxer->audio_next_pts = pts90k != 0 ? pts90k : now_pts90k(muxer);
         muxer->first_pts = muxer->audio_next_pts;
         muxer->first_pts_set = 1;
         muxer->latest_pts = muxer->audio_next_pts;
     }
-    if (ensure_pcm_capacity(muxer, muxer->pcm_size + size) < 0) {
+    current_pts = pts90k != 0 ? pts90k : muxer->audio_next_pts;
+    muxer->audio_ready = 1;
+    if (!muxer->current_segment_open) {
+        muxer->audio_next_pts = current_pts;
+        return 0;
+    }
+    if (write_audio_pes(muxer, data, size, current_pts) < 0) {
         return -1;
     }
-    memcpy(muxer->pcm_buf + muxer->pcm_size, data, size);
-    muxer->pcm_size += size;
-    return encode_pending_audio(muxer);
-#endif
+    muxer->audio_frames++;
+    muxer->latest_pts = current_pts > muxer->latest_pts ? current_pts : muxer->latest_pts;
+    muxer->audio_next_pts = current_pts;
+    return 0;
 }
 
 int rtsp_ts_muxer_write_audio_block(struct rtsp_ts_muxer *muxer, const uint8_t *data, size_t size) {
@@ -1026,30 +730,6 @@ int rtsp_ts_muxer_close(struct rtsp_ts_muxer *muxer) {
         errno = EINVAL;
         return -1;
     }
-#if defined(RTSP_HAS_LIBAV_AAC)
-    AVCodecContext *codec_ctx = (AVCodecContext *)muxer->aac_codec_ctx;
-    if (codec_ctx != NULL) {
-        const size_t bytes_per_frame = (size_t)codec_ctx->frame_size * AUDIO_CHANNELS * AUDIO_PCM_BYTES_PER_SAMPLE;
-
-        if (muxer->pcm_size > 0) {
-            if (ensure_pcm_capacity(muxer, bytes_per_frame) < 0) {
-                return -1;
-            }
-            memset(muxer->pcm_buf + muxer->pcm_size, 0, bytes_per_frame - muxer->pcm_size);
-            muxer->pcm_size = bytes_per_frame;
-            if (encode_pending_audio(muxer) < 0) {
-                return -1;
-            }
-        }
-        if (avcodec_send_frame(codec_ctx, NULL) < 0) {
-            errno = EIO;
-            return -1;
-        }
-        if (drain_aac_packets(muxer) < 0) {
-            return -1;
-        }
-    }
-#endif
     if (flush_access_unit(muxer) < 0) {
         return -1;
     }
@@ -1060,24 +740,9 @@ int rtsp_ts_muxer_close(struct rtsp_ts_muxer *muxer) {
         return -1;
     }
     free(muxer->au_buf);
-#if defined(RTSP_HAS_LIBAV_AAC)
-    free(muxer->pcm_buf);
-    free(muxer->pcm_native_buf);
-#endif
     muxer->au_buf = NULL;
-#if defined(RTSP_HAS_LIBAV_AAC)
-    muxer->pcm_buf = NULL;
-    muxer->pcm_native_buf = NULL;
-    muxer->au_cap = 0;
-    muxer->pcm_cap = 0;
-    muxer->pcm_native_cap = 0;
-    muxer->au_size = 0;
-    muxer->pcm_size = 0;
-#else
     muxer->au_cap = 0;
     muxer->au_size = 0;
-#endif
-    close_aac_encoder(muxer);
     return 0;
 }
 
@@ -1090,9 +755,5 @@ void rtsp_ts_muxer_get_stats(const struct rtsp_ts_muxer *muxer, struct rtsp_ts_m
     stats->audio_blocks = muxer->audio_blocks;
     stats->audio_frames = muxer->audio_frames;
     stats->segment_count = muxer->segment_count;
-#if defined(RTSP_HAS_LIBAV_AAC)
-    stats->audio_enabled = 1;
-#else
-    stats->audio_enabled = 0;
-#endif
+    stats->audio_enabled = muxer->audio_ready;
 }

@@ -16,11 +16,15 @@
 
 struct client_track {
     enum rtsp_client_media_type media_type;
+    char codec_name[32];
     char control_url[512];
     uint8_t payload_type;
     uint8_t rtp_channel;
     uint8_t rtcp_channel;
     uint32_t clock_rate;
+    uint8_t audio_object_type;
+    uint8_t audio_sample_rate_index;
+    uint8_t audio_channel_config;
     uint32_t first_rtp_timestamp;
     int first_rtp_timestamp_set;
     uint8_t sps[128];
@@ -28,6 +32,7 @@ struct client_track {
     uint8_t pps[128];
     size_t pps_size;
     int codec_config_sent;
+    int audio_warned_unsupported;
     uint8_t *fu_buf;
     size_t fu_size;
     size_t fu_cap;
@@ -263,6 +268,47 @@ static int parse_sprop_parameter_sets(struct client_track *track, const char *li
     return 0;
 }
 
+static int parse_audio_rtpmap(struct client_track *track, const char *line, size_t len) {
+    int payload_type = 0;
+    char codec[32];
+    unsigned clock_rate = 0;
+    unsigned channels = 1;
+
+    (void)len;
+
+    if (sscanf(line, "a=rtpmap:%d %31[^/]/%u/%u", &payload_type, codec, &clock_rate, &channels) < 3) {
+        return 0;
+    }
+    if ((uint8_t)payload_type != track->payload_type) {
+        return 0;
+    }
+
+    snprintf(track->codec_name, sizeof(track->codec_name), "%s", codec);
+    track->clock_rate = clock_rate;
+    track->audio_channel_config = (uint8_t)channels;
+    return 0;
+}
+
+static int parse_audio_fmtp(struct client_track *track, const char *line, size_t len) {
+    const char *key = "config=";
+    const char *pos = NULL;
+    unsigned config = 0;
+
+    pos = strstr(line, key);
+    if (pos == NULL || (size_t)(pos - line) >= len) {
+        return 0;
+    }
+    pos += strlen(key);
+    if (sscanf(pos, "%x", &config) != 1) {
+        return -1;
+    }
+
+    track->audio_object_type = (uint8_t)((config >> 11) & 0x1f);
+    track->audio_sample_rate_index = (uint8_t)((config >> 7) & 0x0f);
+    track->audio_channel_config = (uint8_t)((config >> 3) & 0x0f);
+    return 0;
+}
+
 static int emit_video_codec_config(struct rtsp_client_ctx *ctx, struct client_track *track) {
     if (track->media_type != RTSP_CLIENT_MEDIA_VIDEO || track->codec_config_sent) {
         return 0;
@@ -344,7 +390,6 @@ static int parse_tracks_from_sdp(struct rtsp_client_ctx *ctx, const char *descri
                     current = &ctx->tracks[track_count++];
                     current->media_type = RTSP_CLIENT_MEDIA_AUDIO;
                     current->payload_type = (uint8_t)payload_type;
-                    current->clock_rate = 8000;
                 } else {
                     current = NULL;
                 }
@@ -366,6 +411,16 @@ static int parse_tracks_from_sdp(struct rtsp_client_ctx *ctx, const char *descri
             if (parse_sprop_parameter_sets(current, line, len) < 0) {
                 return -1;
             }
+        } else if (current != NULL && current->media_type == RTSP_CLIENT_MEDIA_AUDIO && len > 9 &&
+                   strncmp(line, "a=rtpmap:", 9) == 0) {
+            if (parse_audio_rtpmap(current, line, len) < 0) {
+                return -1;
+            }
+        } else if (current != NULL && current->media_type == RTSP_CLIENT_MEDIA_AUDIO && len > 7 &&
+                   strncmp(line, "a=fmtp:", 7) == 0) {
+            if (parse_audio_fmtp(current, line, len) < 0) {
+                return -1;
+            }
         }
 
         if (line_end == NULL) {
@@ -385,8 +440,75 @@ static int handle_rtp_payload(struct rtsp_client_ctx *ctx, struct client_track *
     }
 
     if (track->media_type == RTSP_CLIENT_MEDIA_AUDIO) {
-        /* PCM 数据一包 RTP 就是完整负载，直接上抛。 */
-        client_emit_frame(ctx, RTSP_CLIENT_MEDIA_AUDIO, payload, payload_size, pts90k);
+        size_t offset = 0;
+        size_t au_headers_length_bits = 0;
+        size_t au_headers_length = 0;
+        size_t data_offset = 0;
+        static const uint32_t sample_rates[] = {96000, 88200, 64000, 48000, 44100, 32000,
+                                                24000, 22050, 16000, 12000, 11025, 8000,
+                                                7350};
+
+        if (strcmp(track->codec_name, "MPEG4-GENERIC") != 0 || track->audio_object_type == 0 ||
+            track->audio_sample_rate_index >= sizeof(sample_rates) / sizeof(sample_rates[0]) ||
+            track->audio_channel_config == 0) {
+            if (!track->audio_warned_unsupported) {
+                fprintf(stderr, "warning: unsupported audio codec in RTSP stream, ignoring audio track\n");
+                track->audio_warned_unsupported = 1;
+            }
+            return 0;
+        }
+        if (payload_size < 4) {
+            return -1;
+        }
+
+        au_headers_length_bits = ((size_t)payload[0] << 8) | payload[1];
+        au_headers_length = (au_headers_length_bits + 7) / 8;
+        data_offset = 2 + au_headers_length;
+        if ((au_headers_length_bits % 16) != 0 || data_offset > payload_size) {
+            return -1;
+        }
+
+        while (offset < au_headers_length) {
+            uint16_t au_size = 0;
+            uint8_t adts[7];
+            const uint8_t *au_data = NULL;
+            size_t frame_size = 0;
+            size_t header_pos = 2 + offset;
+
+            if (offset + 2 > au_headers_length || header_pos + 1 >= payload_size) {
+                return -1;
+            }
+            au_size = (uint16_t)((payload[header_pos] << 5) | (payload[header_pos + 1] >> 3));
+            au_data = payload + data_offset;
+            if (data_offset + au_size > payload_size) {
+                return -1;
+            }
+
+            frame_size = (size_t)au_size + sizeof(adts);
+            adts[0] = 0xFF;
+            adts[1] = 0xF1;
+            adts[2] = (uint8_t)((((track->audio_object_type - 1) & 0x03) << 6) |
+                                ((track->audio_sample_rate_index & 0x0F) << 2) |
+                                ((track->audio_channel_config >> 2) & 0x01));
+            adts[3] = (uint8_t)(((track->audio_channel_config & 0x03) << 6) | ((frame_size >> 11) & 0x03));
+            adts[4] = (uint8_t)((frame_size >> 3) & 0xFF);
+            adts[5] = (uint8_t)(((frame_size & 0x07) << 5) | 0x1F);
+            adts[6] = 0xFC;
+
+            {
+                uint8_t *frame = (uint8_t *)malloc(frame_size);
+                if (frame == NULL) {
+                    return -1;
+                }
+                memcpy(frame, adts, sizeof(adts));
+                memcpy(frame + sizeof(adts), au_data, au_size);
+                client_emit_frame(ctx, RTSP_CLIENT_MEDIA_AUDIO, frame, frame_size, pts90k);
+                free(frame);
+            }
+
+            data_offset += au_size;
+            offset += 2;
+        }
         return 0;
     }
 

@@ -61,17 +61,6 @@ struct rtsp_ts_muxer {
     size_t pps_size;
     int audio_ready;
     uint64_t audio_next_pts;
-    uint64_t audio_samples_encoded;
-    uint8_t *pcm_buf;
-    size_t pcm_size;
-    size_t pcm_cap;
-    uint8_t *pcm_native_buf;
-    size_t pcm_native_cap;
-    int audio_warned_ignored;
-    void *aac_codec_ctx;
-    void *aac_swr_ctx;
-    void *aac_frame;
-    void *aac_packet;
     struct timespec first_clock;
     int first_clock_set;
 };
