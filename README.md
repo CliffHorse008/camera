@@ -6,7 +6,7 @@
 - `server`：RTSP 服务端推流
 - `client`：RTSP 客户端拉流，并通过回调把音视频数据通知上层
 
-默认情况下，程序内置一帧 `1024x768` 的测试图案并循环发送，同时附带一条本地生成的 `L16/8000/1` PCM 单声道音频。
+当前服务端必须传入一个外部 `.mp4` 文件作为输入，并依赖系统中的 `ffmpeg/ffprobe` 提取音视频。
 
 ## 编译
 
@@ -15,26 +15,12 @@ cmake -S . -B build
 cmake --build build
 ```
 
-如果需要 `MP4` 输入能力：
-
-```bash
-cmake -S . -B build -DRTSP_ENABLE_FFMPEG_INPUT=ON
-cmake --build build
-```
-
-如果不需要，也可以显式关闭：
-
-```bash
-cmake -S . -B build -DRTSP_ENABLE_FFMPEG_INPUT=OFF
-cmake --build build
-```
-
 ## Docker
 
 先在本地编译出 `server` 可执行文件：
 
 ```bash
-cmake -S . -B build -DRTSP_ENABLE_FFMPEG_INPUT=ON
+cmake -S . -B build
 cmake --build build --target rtsp_h264_server
 ```
 
@@ -44,7 +30,7 @@ cmake --build build --target rtsp_h264_server
 docker build -t rtsp-h264-server .
 ```
 
-Docker 镜像默认启用 `MP4` 输入支持，并在镜像内安装 `ffmpeg/ffprobe`。
+Docker 镜像内安装 `ffmpeg/ffprobe`，用于服务端加载 `.mp4` 输入。
 
 运行示例：
 
@@ -63,28 +49,16 @@ docker run --rm -p 5554:5554/tcp -p 5554:5554/udp \
 ## 运行
 
 ```bash
-./build/rtsp_h264_server
-```
-
-也可以直接指定一个本地 `.h264` 文件作为数据源：
-
-```bash
-./build/rtsp_h264_server --input /path/to/input.h264
-```
-
-也支持直接指定一个本地 `.mp4` 文件。服务端会在启动时用 `ffmpeg` 提取视频源，并把音频转成 `L16/8000/1` 作为 RTSP 音频轨：
-
-```bash
 ./build/rtsp_h264_server --input /path/to/input.mp4
 ```
 
 也兼容旧的单个位置参数写法：
 
 ```bash
-./build/rtsp_h264_server /path/to/input.h264
+./build/rtsp_h264_server /path/to/input.mp4
 ```
 
-`MP4` 模式依赖构建时启用 `RTSP_ENABLE_FFMPEG_INPUT`，并且系统里存在可执行的 `ffmpeg` 和 `ffprobe`。如果当前二进制不支持 `MP4` 输入，程序会直接提示缺少对应能力。
+服务端会在启动时用 `ffmpeg` 提取视频源，并把音频转成 `AAC` 作为 RTSP 音频轨。如果系统缺少 `ffmpeg` 或 `ffprobe`，CMake 配置阶段会直接失败。
 
 启动后会监听：
 
@@ -108,7 +82,7 @@ ffplay -rtsp_transport tcp rtsp://127.0.0.1:5554/live
 
 ## Client 示例
 
-客户端示例默认使用 RTSP over TCP 拉流，并用内置的最小 `MPEG-TS/HLS` 骨架直接写出 `TS` 切片，同时同步更新 `playlist.m3u8`。视频按关键帧切片，音频会把 `L16/8000/1 PCM` 实时编码成 `AAC` 后一起复用进 `TS`：
+客户端示例默认使用 RTSP over TCP 拉流，并用内置的最小 `MPEG-TS/HLS` 骨架直接写出 `TS` 切片，同时同步更新 `playlist.m3u8`。视频按关键帧切片，音频轨为 `AAC` 时会直接一起复用进 `TS`：
 
 ```bash
 ./build/rtsp_h264_client_demo rtsp://127.0.0.1:5554/live
@@ -129,4 +103,4 @@ cmake -S . -B build -DRTSP_ENABLE_LIBAV_AAC=OFF
 cmake --build build --target rtsp_h264_client_demo
 ```
 
-关闭后客户端仍会生成视频 `TS/HLS`，但收到 `PCM` 音频时只会打印一次告警并忽略，不做 `PCM -> AAC` 转换。
+关闭后客户端仍会生成视频 `TS/HLS`，但如果后续接入的源流需要本地音频转码能力，相关处理将不可用。

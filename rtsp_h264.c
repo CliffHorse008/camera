@@ -6,15 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(RTSP_HAS_FFMPEG_INPUT)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#endif
-
-#include "default_h264_1024x768.h"
 
 static int starts_with(const uint8_t *data, size_t size, size_t i, size_t *prefix_len) {
     if (i + 4 <= size && data[i] == 0x00 && data[i + 1] == 0x00 &&
@@ -59,11 +55,14 @@ static void cleanup_owned_media(struct rtsp_h264_stream_source *stream) {
     free(stream->owned_data);
     free(stream->frames);
     free(stream->audio_data);
+    free(stream->audio_frames);
     stream->owned_data = NULL;
     stream->frames = NULL;
     stream->audio_data = NULL;
+    stream->audio_frames = NULL;
     stream->frame_count = 0;
     stream->audio_size = 0;
+    stream->audio_frame_count = 0;
 }
 
 static int parse_frames_from_buffer(const uint8_t *data, size_t size, struct rtsp_h264_frame **frames_out,
@@ -209,16 +208,6 @@ static int configure_stream_source(struct rtsp_h264_stream_source *stream, const
     return 0;
 }
 
-int rtsp_h264_stream_source_init_default(struct rtsp_h264_stream_source *stream) {
-    int rc = configure_stream_source(stream, _tmp_default_1024x768_h264, _tmp_default_1024x768_h264_len,
-                                     "Embedded 1024x768 Test Pattern");
-    if (rc == 0) {
-        stream->has_audio_track = 1;
-        stream->synthetic_audio = 1;
-    }
-    return rc;
-}
-
 static int read_file_into_buffer(const char *path, uint8_t **buf_out, size_t *size_out) {
     FILE *fp = NULL;
     uint8_t *buf = NULL;
@@ -266,7 +255,81 @@ static int read_file_into_buffer(const char *path, uint8_t **buf_out, size_t *si
     return 0;
 }
 
-#if defined(RTSP_HAS_FFMPEG_INPUT)
+static int parse_adts_frames(struct rtsp_h264_stream_source *stream) {
+    static const uint32_t sample_rates[] = {96000, 88200, 64000, 48000, 44100, 32000,
+                                            24000, 22050, 16000, 12000, 11025, 8000,
+                                            7350};
+    struct rtsp_aac_frame *frames = NULL;
+    size_t frames_cap = 0;
+    size_t frame_count = 0;
+    size_t offset = 0;
+    uint8_t profile = 0;
+    uint8_t sample_rate_index = 0;
+    uint8_t channel_config = 0;
+
+    while (offset + 7 <= stream->audio_size) {
+        size_t header_size = 0;
+        size_t frame_size = 0;
+
+        if (stream->audio_data[offset] != 0xff || (stream->audio_data[offset + 1] & 0xf0) != 0xf0) {
+            free(frames);
+            return -1;
+        }
+
+        profile = (uint8_t)((stream->audio_data[offset + 2] >> 6) & 0x03);
+        sample_rate_index = (uint8_t)((stream->audio_data[offset + 2] >> 2) & 0x0f);
+        channel_config = (uint8_t)(((stream->audio_data[offset + 2] & 0x01) << 2) |
+                                   ((stream->audio_data[offset + 3] >> 6) & 0x03));
+        header_size = (stream->audio_data[offset + 1] & 0x01) ? 7u : 9u;
+        frame_size = (size_t)(((stream->audio_data[offset + 3] & 0x03) << 11) |
+                              ((uint16_t)stream->audio_data[offset + 4] << 3) |
+                              ((stream->audio_data[offset + 5] >> 5) & 0x07));
+
+        if (sample_rate_index >= sizeof(sample_rates) / sizeof(sample_rates[0]) ||
+            channel_config == 0 || frame_size < header_size || offset + frame_size > stream->audio_size) {
+            free(frames);
+            return -1;
+        }
+
+        if (frame_count == frames_cap) {
+            size_t new_cap = frames_cap == 0 ? 64 : frames_cap * 2;
+            struct rtsp_aac_frame *new_frames =
+                (struct rtsp_aac_frame *)realloc(frames, new_cap * sizeof(*new_frames));
+            if (new_frames == NULL) {
+                free(frames);
+                return -1;
+            }
+            frames = new_frames;
+            frames_cap = new_cap;
+        }
+
+        frames[frame_count].data = stream->audio_data + offset + header_size;
+        frames[frame_count].size = frame_size - header_size;
+        ++frame_count;
+        offset += frame_size;
+    }
+
+    if (frame_count == 0 || offset != stream->audio_size) {
+        free(frames);
+        return -1;
+    }
+
+    stream->audio_frames = frames;
+    stream->audio_frame_count = frame_count;
+    stream->audio_sample_rate = sample_rates[sample_rate_index];
+    stream->audio_samples_per_frame = 1024;
+    stream->audio_channels = channel_config;
+
+    {
+        uint8_t audio_object_type = (uint8_t)(profile + 1);
+        uint16_t asc = (uint16_t)((audio_object_type << 11) | (sample_rate_index << 7) |
+                                  (channel_config << 3));
+        snprintf(stream->audio_config_hex, sizeof(stream->audio_config_hex), "%04X", asc);
+    }
+
+    return 0;
+}
+
 static int run_child_to_null(const char *const argv[]) {
     pid_t pid = fork();
     int status = 0;
@@ -402,28 +465,7 @@ static int make_temp_path(char *path, size_t path_size, const char *tag) {
     close(fd);
     return 0;
 }
-#endif
 
-int rtsp_h264_stream_source_load_file(struct rtsp_h264_stream_source *stream, const char *path) {
-    uint8_t *buf = NULL;
-
-    memset(stream, 0, sizeof(*stream));
-    if (read_file_into_buffer(path, &buf, &stream->size) < 0 || buf == NULL || stream->size == 0) {
-        free(buf);
-        return -1;
-    }
-
-    if (configure_stream_source(stream, buf, stream->size, path) < 0) {
-        free(buf);
-        return -1;
-    }
-    stream->owned_data = buf;
-    stream->has_audio_track = 1;
-    stream->synthetic_audio = 1;
-    return 0;
-}
-
-#if defined(RTSP_HAS_FFMPEG_INPUT)
 int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, const char *path) {
     char video_tmp[64] = {0};
     char audio_tmp[64] = {0};
@@ -459,14 +501,12 @@ int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, con
                                              "-map",
                                              "0:a:0?",
                                              "-vn",
-                                             "-acodec",
-                                             "pcm_s16be",
+                                             "-c:a",
+                                             "aac",
+                                             "-profile:a",
+                                             "aac_low",
                                              "-f",
-                                             "s16be",
-                                             "-ar",
-                                             "8000",
-                                             "-ac",
-                                             "1",
+                                             "adts",
                                              audio_tmp,
                                              NULL};
 
@@ -520,27 +560,23 @@ int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, con
     stream->owned_data = video_buf;
     stream->audio_data = audio_buf;
     stream->audio_size = audio_size;
-    stream->has_audio_track = audio_size > 0;
-    stream->synthetic_audio = 0;
+    stream->has_audio_track = 0;
+    if (audio_size > 0) {
+        if (parse_adts_frames(stream) < 0) {
+            cleanup_owned_media(stream);
+            return -1;
+        }
+        if (stream->audio_frame_count == 0 || stream->audio_sample_rate == 0 ||
+            stream->audio_samples_per_frame == 0 || stream->audio_channels == 0 ||
+            stream->audio_config_hex[0] == '\0') {
+            cleanup_owned_media(stream);
+            return -1;
+        }
+        stream->has_audio_track = 1;
+    }
     stream->video_fps_num = fps_num;
     stream->video_fps_den = fps_den;
     return 0;
-}
-#else
-int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, const char *path) {
-    (void)stream;
-    (void)path;
-    errno = ENOSYS;
-    return -1;
-}
-#endif
-
-int rtsp_h264_stream_source_supports_mp4(void) {
-#if defined(RTSP_HAS_FFMPEG_INPUT)
-    return 1;
-#else
-    return 0;
-#endif
 }
 
 void rtsp_h264_stream_source_cleanup(struct rtsp_h264_stream_source *stream) {

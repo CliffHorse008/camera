@@ -11,18 +11,10 @@ find_program(FFMPEG_EXECUTABLE ffmpeg)
 find_program(FFPROBE_EXECUTABLE ffprobe)
 find_package(PkgConfig QUIET)
 
-option(RTSP_ENABLE_FFMPEG_INPUT "Enable MP4 input support through ffmpeg/ffprobe tools" ON)
 option(RTSP_ENABLE_LIBAV_AAC "Enable PCM to AAC conversion in client demo through libavcodec/libavutil/libswresample" ON)
 
-set(RTSP_WITH_FFMPEG_INPUT OFF)
-if(RTSP_ENABLE_FFMPEG_INPUT)
-    if(FFMPEG_EXECUTABLE AND FFPROBE_EXECUTABLE)
-        set(RTSP_WITH_FFMPEG_INPUT ON)
-    else()
-        message(STATUS "RTSP_ENABLE_FFMPEG_INPUT=ON but ffmpeg/ffprobe not found; MP4 input support disabled")
-    endif()
-else()
-    message(STATUS "MP4 input support disabled by RTSP_ENABLE_FFMPEG_INPUT=OFF")
+if(NOT FFMPEG_EXECUTABLE OR NOT FFPROBE_EXECUTABLE)
+    message(FATAL_ERROR "ffmpeg and ffprobe are required to build this project")
 endif()
 
 add_library(rtsp_core
@@ -50,10 +42,6 @@ foreach(target rtsp_core rtsp_server_lib rtsp_client_lib)
         -pedantic
     )
 endforeach()
-
-if(RTSP_WITH_FFMPEG_INPUT)
-    target_compile_definitions(rtsp_core PUBLIC RTSP_HAS_FFMPEG_INPUT=1)
-endif()
 
 set(RTSP_WITH_LIBAV_AAC OFF)
 if(RTSP_ENABLE_LIBAV_AAC)

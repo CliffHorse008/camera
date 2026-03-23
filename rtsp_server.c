@@ -1,7 +1,6 @@
 #include "rtsp_server.h"
 
 #include <arpa/inet.h>
-#include <math.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -17,10 +16,7 @@
 #include "rtsp_common.h"
 
 #define STREAM_FPS 25
-#define AUDIO_SAMPLE_RATE 8000
-#define AUDIO_CHANNELS 1
-#define AUDIO_SAMPLES_PER_PACKET 160
-#define RTP_PAYLOAD_TYPE_PCM 97
+#define RTP_PAYLOAD_TYPE_AAC 97
 
 enum media_track_type {
     MEDIA_TRACK_VIDEO = 0,
@@ -57,8 +53,7 @@ struct server_session {
     const struct rtsp_h264_stream_source *stream;
     pthread_t sender_thread;
     pthread_mutex_t write_lock;
-    double audio_phase;
-    size_t audio_offset;
+    size_t audio_frame_index;
     size_t frame_index;
     uint64_t audio_packet_accumulator;
 };
@@ -221,49 +216,31 @@ static int send_h264_nal(struct server_session *session, const uint8_t *nal, siz
     return 0;
 }
 
-static int fill_pcm_payload(struct server_session *session, uint8_t *payload, size_t payload_size) {
-    const double freq = 440.0;
-    const double step = 2.0 * 3.14159265358979323846 * freq / AUDIO_SAMPLE_RATE;
-    size_t samples = payload_size / 2;
-
-    /* 生成简单正弦波，方便识别默认音频轨。 */
-    for (size_t i = 0; i < samples; ++i) {
-        int16_t sample = (int16_t)(sin(session->audio_phase) * 12000.0);
-        payload[i * 2] = (uint8_t)((sample >> 8) & 0xff);
-        payload[i * 2 + 1] = (uint8_t)(sample & 0xff);
-        session->audio_phase += step;
-        if (session->audio_phase >= 2.0 * 3.14159265358979323846) {
-            session->audio_phase -= 2.0 * 3.14159265358979323846;
-        }
-    }
-    return 0;
-}
-
 static int fill_audio_payload(struct server_session *session, uint8_t *payload, size_t payload_size) {
-    if (session->stream->audio_data != NULL && session->stream->audio_size > 0) {
-        size_t copied = 0;
+    const struct rtsp_aac_frame *frame = NULL;
+    uint16_t au_headers_bits = 16;
+    uint16_t au_size = 0;
 
-        while (copied < payload_size) {
-            size_t remain = session->stream->audio_size - session->audio_offset;
-            size_t chunk = payload_size - copied;
-            if (remain == 0) {
-                session->audio_offset = 0;
-                remain = session->stream->audio_size;
-            }
-            if (chunk > remain) {
-                chunk = remain;
-            }
-            memcpy(payload + copied, session->stream->audio_data + session->audio_offset, chunk);
-            copied += chunk;
-            session->audio_offset += chunk;
-            if (session->audio_offset >= session->stream->audio_size) {
-                session->audio_offset = 0;
-            }
-        }
-        return 0;
+    if (session->stream->audio_frames == NULL || session->stream->audio_frame_count == 0) {
+        (void)payload;
+        (void)payload_size;
+        return -1;
     }
 
-    return fill_pcm_payload(session, payload, payload_size);
+    frame = &session->stream->audio_frames[session->audio_frame_index];
+    au_size = (uint16_t)frame->size;
+    if (frame->size > 0x1fff || payload_size < frame->size + 4) {
+        return -1;
+    }
+
+    payload[0] = (uint8_t)(au_headers_bits >> 8);
+    payload[1] = (uint8_t)(au_headers_bits & 0xff);
+    payload[2] = (uint8_t)(au_size >> 5);
+    payload[3] = (uint8_t)((au_size & 0x1f) << 3);
+    memcpy(payload + 4, frame->data, frame->size);
+
+    session->audio_frame_index = (session->audio_frame_index + 1) % session->stream->audio_frame_count;
+    return (int)(frame->size + 4);
 }
 
 static void *sender_thread_main(void *arg) {
@@ -271,10 +248,12 @@ static void *sender_thread_main(void *arg) {
     struct rtsp_h264_nal_unit nals[64];
     uint32_t fps_num = session->stream->video_fps_num > 0 ? session->stream->video_fps_num : STREAM_FPS;
     uint32_t fps_den = session->stream->video_fps_den > 0 ? session->stream->video_fps_den : 1;
+    uint32_t audio_sample_rate = session->stream->audio_sample_rate;
+    uint32_t audio_samples_per_frame = session->stream->audio_samples_per_frame;
     useconds_t frame_sleep_us = (useconds_t)(((uint64_t)1000000 * fps_den) / fps_num);
     uint32_t frame_ts_step = (uint32_t)(((uint64_t)RTP_CLOCK_H264 * fps_den) / fps_num);
-    uint64_t audio_packet_threshold = (uint64_t)fps_num * AUDIO_SAMPLES_PER_PACKET;
-    uint8_t audio_payload[AUDIO_SAMPLES_PER_PACKET * 2];
+    uint64_t audio_packet_threshold = (uint64_t)fps_num * audio_samples_per_frame;
+    uint8_t audio_payload[1600];
 
     while (!session->stop_sender) {
         if (session->video_track.configured && session->stream->frame_count > 0) {
@@ -295,15 +274,19 @@ static void *sender_thread_main(void *arg) {
         }
 
         if (session->audio_track.configured && session->stream->has_audio_track) {
-            session->audio_packet_accumulator += (uint64_t)AUDIO_SAMPLE_RATE * fps_den;
+            session->audio_packet_accumulator += (uint64_t)audio_sample_rate * fps_den;
             while (session->audio_packet_accumulator >= audio_packet_threshold && !session->stop_sender) {
-                fill_audio_payload(session, audio_payload, sizeof(audio_payload));
-                if (send_rtp_packet(session, &session->audio_track, audio_payload, sizeof(audio_payload),
-                                    0) < 0) {
+                int audio_payload_size = fill_audio_payload(session, audio_payload, sizeof(audio_payload));
+                if (audio_payload_size < 0) {
                     session->stop_sender = 1;
                     break;
                 }
-                session->audio_track.timestamp += AUDIO_SAMPLES_PER_PACKET;
+                if (send_rtp_packet(session, &session->audio_track, audio_payload,
+                                    (size_t)audio_payload_size, 1) < 0) {
+                    session->stop_sender = 1;
+                    break;
+                }
+                session->audio_track.timestamp += audio_samples_per_frame;
                 session->audio_packet_accumulator -= audio_packet_threshold;
             }
         }
@@ -369,13 +352,17 @@ static int handle_describe(struct server_session *session, int cseq, const char 
         return -1;
     }
     if (session->stream->has_audio_track) {
+        uint32_t audio_sample_rate = session->stream->audio_sample_rate;
+        uint32_t audio_channels = session->stream->audio_channels;
         len += snprintf(sdp + len, sizeof(sdp) - (size_t)len,
                         "m=audio 0 RTP/AVP 97\r\n"
                         "c=IN IP4 0.0.0.0\r\n"
-                        "a=rtpmap:97 L16/8000/1\r\n"
+                        "a=rtpmap:97 MPEG4-GENERIC/%u/%u\r\n"
+                        "a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;config=%s;"
+                        "SizeLength=13;IndexLength=3;IndexDeltaLength=3\r\n"
                         "a=control:trackID=1\r\n"
-                        "a=ptime:20\r\n"
-                        "a=maxptime:20\r\n");
+                        "a=ptime:23\r\n",
+                        audio_sample_rate, audio_channels, session->stream->audio_config_hex);
         if (len < 0 || (size_t)len >= sizeof(sdp)) {
             return -1;
         }
@@ -686,7 +673,7 @@ int rtsp_server_run(const struct rtsp_h264_stream_source *stream, uint16_t port,
         session->video_track.ssrc = (uint32_t)rand();
         session->audio_track.rtp_fd = -1;
         session->audio_track.rtcp_fd = -1;
-        session->audio_track.payload_type = RTP_PAYLOAD_TYPE_PCM;
+        session->audio_track.payload_type = RTP_PAYLOAD_TYPE_AAC;
         session->audio_track.seq = (uint16_t)(rand() & 0xffff);
         session->audio_track.timestamp = (uint32_t)rand();
         session->audio_track.ssrc = (uint32_t)rand();

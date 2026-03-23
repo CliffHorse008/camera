@@ -20,11 +20,11 @@ static void on_signal(int signo) {
 
 static void print_usage(FILE *fp, const char *prog) {
     fprintf(fp,
-            "Usage: %s [--input PATH]\n"
-            "       %s [PATH]\n"
+            "Usage: %s --input PATH.mp4\n"
+            "       %s PATH.mp4\n"
             "\n"
             "Options:\n"
-            "  -i, --input PATH   Input media file (.h264 or .mp4)\n"
+            "  -i, --input PATH   Input MP4 media file\n"
             "  -h, --help         Show this help message\n",
             prog, prog);
 }
@@ -71,36 +71,19 @@ int main(int argc, char **argv) {
         input_path = argv[optind];
     }
 
-    if (input_path != NULL) {
-        const char *ext = strrchr(input_path, '.');
+    if (input_path == NULL) {
+        fprintf(stderr, "missing input mp4 file; pass --input PATH.mp4\n");
+        goto done;
+    }
 
-        if (ext != NULL && strcasecmp(ext, ".mp4") == 0) {
-            if (!rtsp_h264_stream_source_supports_mp4()) {
-                fprintf(stderr,
-                        "mp4 input is not available in this build; rebuild with "
-                        "RTSP_ENABLE_FFMPEG_INPUT=ON and ffmpeg/ffprobe installed\n");
-                goto done;
-            }
-            if (rtsp_h264_stream_source_load_mp4(&stream, input_path) < 0) {
-                fprintf(stderr, "failed to load mp4 file: %s", input_path);
-                if (errno == ENOSYS) {
-                    fprintf(stderr, " (ffmpeg input support is not compiled in)");
-                }
-                fputc('\n', stderr);
-                goto done;
-            }
-        } else {
-            if (ext != NULL && strcasecmp(ext, ".h264") != 0) {
-                fprintf(stderr, "unsupported input type: %s\n", input_path);
-                goto done;
-            }
-            if (rtsp_h264_stream_source_load_file(&stream, input_path) < 0) {
-                fprintf(stderr, "failed to load h264 file: %s\n", input_path);
-                goto done;
-            }
-        }
-    } else if (rtsp_h264_stream_source_init_default(&stream) < 0) {
-        fprintf(stderr, "failed to initialize embedded h264 stream\n");
+    const char *ext = strrchr(input_path, '.');
+    if (ext == NULL || strcasecmp(ext, ".mp4") != 0) {
+        fprintf(stderr, "unsupported input type: %s (only .mp4 is allowed)\n", input_path);
+        goto done;
+    }
+
+    if (rtsp_h264_stream_source_load_mp4(&stream, input_path) < 0) {
+        fprintf(stderr, "failed to load mp4 file: %s\n", input_path);
         goto done;
     }
 
