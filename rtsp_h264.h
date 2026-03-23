@@ -31,6 +31,7 @@ struct rtsp_h264_stream_source {
     size_t audio_frame_count;
     uint32_t audio_sample_rate;
     uint32_t audio_samples_per_frame;
+    uint64_t audio_total_samples;
     uint8_t audio_channels;
     uint32_t video_fps_num;
     uint32_t video_fps_den;

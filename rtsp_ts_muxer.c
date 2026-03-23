@@ -424,36 +424,47 @@ static int write_video_pes(struct rtsp_ts_muxer *muxer, const uint8_t *data, siz
     return 0;
 }
 
-static int write_pending_codec_config(struct rtsp_ts_muxer *muxer, uint64_t pts) {
-    uint8_t config[512];
-    size_t used = 0;
+static int write_access_unit_with_codec_config(struct rtsp_ts_muxer *muxer, uint64_t pts) {
     static const uint8_t start_code[4] = {0x00, 0x00, 0x00, 0x01};
 
-    if (!muxer->segment_needs_codec_config) {
-        return 0;
-    }
-    if (muxer->sps_size == 0 || muxer->pps_size == 0) {
+    if (muxer->segment_needs_codec_config && muxer->sps_size > 0 && muxer->pps_size > 0) {
+        size_t prefix_size = sizeof(start_code) + muxer->sps_size + sizeof(start_code) + muxer->pps_size;
+        uint8_t *data = NULL;
+
+        if (!muxer->au_is_keyframe) {
+            return 0;
+        }
+        if (prefix_size + muxer->au_size < prefix_size) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+
+        data = (uint8_t *)malloc(prefix_size + muxer->au_size);
+        if (data == NULL) {
+            return -1;
+        }
+
+        memcpy(data, start_code, sizeof(start_code));
+        memcpy(data + sizeof(start_code), muxer->sps, muxer->sps_size);
+        memcpy(data + sizeof(start_code) + muxer->sps_size, start_code, sizeof(start_code));
+        memcpy(data + sizeof(start_code) + muxer->sps_size + sizeof(start_code), muxer->pps, muxer->pps_size);
+        memcpy(data + prefix_size, muxer->au_buf, muxer->au_size);
+
+        if (write_video_pes(muxer, data, prefix_size + muxer->au_size, pts) < 0) {
+            free(data);
+            return -1;
+        }
+        free(data);
         muxer->segment_needs_codec_config = 0;
         return 0;
     }
-    if (sizeof(start_code) + muxer->sps_size + sizeof(start_code) + muxer->pps_size > sizeof(config)) {
-        errno = EOVERFLOW;
+
+    if (write_video_pes(muxer, muxer->au_buf, muxer->au_size, pts) < 0) {
         return -1;
     }
-
-    memcpy(config + used, start_code, sizeof(start_code));
-    used += sizeof(start_code);
-    memcpy(config + used, muxer->sps, muxer->sps_size);
-    used += muxer->sps_size;
-    memcpy(config + used, start_code, sizeof(start_code));
-    used += sizeof(start_code);
-    memcpy(config + used, muxer->pps, muxer->pps_size);
-    used += muxer->pps_size;
-
-    if (write_video_pes(muxer, config, used, pts) < 0) {
-        return -1;
+    if (muxer->segment_needs_codec_config) {
+        muxer->segment_needs_codec_config = 0;
     }
-    muxer->segment_needs_codec_config = 0;
     return 0;
 }
 
@@ -603,10 +614,7 @@ static int flush_access_unit(struct rtsp_ts_muxer *muxer) {
             }
         }
     }
-    if (write_pending_codec_config(muxer, pts) < 0) {
-        return -1;
-    }
-    if (write_video_pes(muxer, muxer->au_buf, muxer->au_size, pts) < 0) {
+    if (write_access_unit_with_codec_config(muxer, pts) < 0) {
         return -1;
     }
 

@@ -418,26 +418,42 @@ static int parse_fraction(const char *value, uint32_t *num_out, uint32_t *den_ou
     return 0;
 }
 
-static int probe_mp4_video_info(const char *path, uint32_t *fps_num_out, uint32_t *fps_den_out) {
-    const char *const argv[] = {"ffprobe",
-                                "-v",
-                                "error",
-                                "-select_streams",
-                                "v:0",
-                                "-show_entries",
-                                "stream=codec_name,avg_frame_rate",
-                                "-of",
-                                "default=noprint_wrappers=1:nokey=0",
-                                path,
-                                NULL};
+static int probe_mp4_video_info(const char *path, uint32_t *fps_num_out, uint32_t *fps_den_out,
+                                int *audio_is_aac_out, uint64_t *audio_total_samples_out) {
+    const char *const video_argv[] = {"ffprobe",
+                                      "-v",
+                                      "error",
+                                      "-select_streams",
+                                      "v:0",
+                                      "-show_entries",
+                                      "stream=codec_name,avg_frame_rate",
+                                      "-of",
+                                      "default=noprint_wrappers=1:nokey=0",
+                                      path,
+                                      NULL};
+    const char *const audio_argv[] = {"ffprobe",
+                                      "-v",
+                                      "error",
+                                      "-select_streams",
+                                      "a:0",
+                                      "-show_entries",
+                                      "stream=codec_name,duration_ts",
+                                      "-of",
+                                      "default=noprint_wrappers=1:nokey=0",
+                                      path,
+                                      NULL};
     char output[1024];
     char *codec_line = NULL;
     char *fps_line = NULL;
 
-    if (capture_child_stdout(argv, output, sizeof(output)) < 0) {
+    *fps_num_out = 0;
+    *fps_den_out = 0;
+    *audio_is_aac_out = 0;
+    *audio_total_samples_out = 0;
+
+    if (capture_child_stdout(video_argv, output, sizeof(output)) < 0) {
         return -1;
     }
-
     codec_line = strstr(output, "codec_name=");
     fps_line = strstr(output, "avg_frame_rate=");
     if (codec_line == NULL || fps_line == NULL) {
@@ -451,6 +467,22 @@ static int probe_mp4_video_info(const char *path, uint32_t *fps_num_out, uint32_
     if (parse_fraction(fps_line, fps_num_out, fps_den_out) < 0) {
         return -1;
     }
+
+    if (capture_child_stdout(audio_argv, output, sizeof(output)) == 0) {
+        codec_line = strstr(output, "codec_name=");
+        if (codec_line != NULL) {
+            codec_line += strlen("codec_name=");
+            if (strncmp(codec_line, "aac", 3) == 0) {
+                *audio_is_aac_out = 1;
+            }
+        }
+        fps_line = strstr(output, "duration_ts=");
+        if (fps_line != NULL) {
+            fps_line += strlen("duration_ts=");
+            *audio_total_samples_out = (uint64_t)strtoull(fps_line, NULL, 10);
+        }
+    }
+
     return 0;
 }
 
@@ -475,6 +507,8 @@ int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, con
     size_t audio_size = 0;
     uint32_t fps_num = 25;
     uint32_t fps_den = 1;
+    int audio_is_aac = 0;
+    uint64_t audio_total_samples = 0;
     const char *const ffmpeg_video_argv[] = {"ffmpeg",
                                              "-y",
                                              "-i",
@@ -485,9 +519,13 @@ int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, con
                                              "-c:v",
                                              "libx264",
                                              "-preset",
-                                             "ultrafast",
-                                             "-tune",
-                                             "zerolatency",
+                                             "medium",
+                                             "-crf",
+                                             "18",
+                                             "-bf",
+                                             "0",
+                                             "-pix_fmt",
+                                             "yuv420p",
                                              "-x264-params",
                                              "aud=1:repeat-headers=1",
                                              "-f",
@@ -509,10 +547,23 @@ int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, con
                                              "adts",
                                              audio_tmp,
                                              NULL};
+    const char *const ffmpeg_audio_copy_argv[] = {"ffmpeg",
+                                                  "-y",
+                                                  "-i",
+                                                  path,
+                                                  "-map",
+                                                  "0:a:0?",
+                                                  "-vn",
+                                                  "-c:a",
+                                                  "copy",
+                                                  "-f",
+                                                  "adts",
+                                                  audio_tmp,
+                                                  NULL};
 
     memset(stream, 0, sizeof(*stream));
 
-    if (probe_mp4_video_info(path, &fps_num, &fps_den) < 0) {
+    if (probe_mp4_video_info(path, &fps_num, &fps_den, &audio_is_aac, &audio_total_samples) < 0) {
         return -1;
     }
     if (make_temp_path(video_tmp, sizeof(video_tmp), "video") < 0 ||
@@ -531,7 +582,7 @@ int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, con
         unlink(audio_tmp);
         return -1;
     }
-    (void)run_child_to_null(ffmpeg_audio_argv);
+    (void)run_child_to_null(audio_is_aac ? ffmpeg_audio_copy_argv : ffmpeg_audio_argv);
 
     if (read_file_into_buffer(video_tmp, &video_buf, &video_size) < 0 || video_buf == NULL ||
         video_size == 0) {
@@ -572,6 +623,9 @@ int rtsp_h264_stream_source_load_mp4(struct rtsp_h264_stream_source *stream, con
             cleanup_owned_media(stream);
             return -1;
         }
+        stream->audio_total_samples = audio_total_samples > 0 ? audio_total_samples
+                                                              : (uint64_t)stream->audio_frame_count *
+                                                                    (uint64_t)stream->audio_samples_per_frame;
         stream->has_audio_track = 1;
     }
     stream->video_fps_num = fps_num;

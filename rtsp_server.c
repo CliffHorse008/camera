@@ -56,6 +56,7 @@ struct server_session {
     size_t audio_frame_index;
     size_t frame_index;
     uint64_t audio_packet_accumulator;
+    uint64_t audio_timestamp_accumulator;
 };
 
 static int open_udp_socket(uint16_t *bound_port) {
@@ -248,12 +249,18 @@ static void *sender_thread_main(void *arg) {
     struct rtsp_h264_nal_unit nals[64];
     uint32_t fps_num = session->stream->video_fps_num > 0 ? session->stream->video_fps_num : STREAM_FPS;
     uint32_t fps_den = session->stream->video_fps_den > 0 ? session->stream->video_fps_den : 1;
-    uint32_t audio_sample_rate = session->stream->audio_sample_rate;
-    uint32_t audio_samples_per_frame = session->stream->audio_samples_per_frame;
+    uint64_t audio_frame_count = session->stream->audio_frame_count;
+    uint64_t audio_total_samples = session->stream->audio_total_samples;
+    uint32_t audio_timestamp_step = 0;
+    uint32_t audio_timestamp_step_remainder = 0;
     useconds_t frame_sleep_us = (useconds_t)(((uint64_t)1000000 * fps_den) / fps_num);
     uint32_t frame_ts_step = (uint32_t)(((uint64_t)RTP_CLOCK_H264 * fps_den) / fps_num);
-    uint64_t audio_packet_threshold = (uint64_t)fps_num * audio_samples_per_frame;
     uint8_t audio_payload[1600];
+
+    if (audio_frame_count > 0) {
+        audio_timestamp_step = (uint32_t)(audio_total_samples / audio_frame_count);
+        audio_timestamp_step_remainder = (uint32_t)(audio_total_samples % audio_frame_count);
+    }
 
     while (!session->stop_sender) {
         if (session->video_track.configured && session->stream->frame_count > 0) {
@@ -274,8 +281,9 @@ static void *sender_thread_main(void *arg) {
         }
 
         if (session->audio_track.configured && session->stream->has_audio_track) {
-            session->audio_packet_accumulator += (uint64_t)audio_sample_rate * fps_den;
-            while (session->audio_packet_accumulator >= audio_packet_threshold && !session->stop_sender) {
+            session->audio_packet_accumulator += audio_frame_count;
+            while (session->audio_packet_accumulator >= session->stream->frame_count && !session->stop_sender) {
+                uint32_t audio_timestamp_increment = audio_timestamp_step;
                 int audio_payload_size = fill_audio_payload(session, audio_payload, sizeof(audio_payload));
                 if (audio_payload_size < 0) {
                     session->stop_sender = 1;
@@ -286,8 +294,13 @@ static void *sender_thread_main(void *arg) {
                     session->stop_sender = 1;
                     break;
                 }
-                session->audio_track.timestamp += audio_samples_per_frame;
-                session->audio_packet_accumulator -= audio_packet_threshold;
+                session->audio_timestamp_accumulator += audio_timestamp_step_remainder;
+                if (session->audio_timestamp_accumulator >= audio_frame_count) {
+                    audio_timestamp_increment += 1;
+                    session->audio_timestamp_accumulator -= audio_frame_count;
+                }
+                session->audio_track.timestamp += audio_timestamp_increment;
+                session->audio_packet_accumulator -= session->stream->frame_count;
             }
         }
 
